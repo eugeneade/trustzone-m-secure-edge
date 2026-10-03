@@ -1,0 +1,9 @@
+Debug/
+Release/
+*.o
+*.elf
+*.map
+*.bin
+*.hex
+.settings/
+__pycache__/
