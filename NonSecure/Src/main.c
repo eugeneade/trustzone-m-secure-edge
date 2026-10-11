@@ -2,81 +2,14 @@
  * Non-Secure world: application side of the Secure crypto service.
  *
  * Exercises the Secure world through the NSC veneers (M1 round trip, M2 MAC
- * service and pointer validation) and reports the results
- * on LPUART1 (PG7/PG8), which the NUCLEO-L552ZE-Q routes to the ST-LINK
- * virtual COM port at 115200 8N1.
+ * service and pointer validation), then runs the M3 benchmark. Results go to
+ * the ST-LINK virtual COM port (see uart.h).
  */
 #include <stddef.h>
 #include "stm32l5xx.h"
 #include "secure_nsc.h"
-
-#define UART_BAUD  115200UL
-
-static void uart_init(void)
-{
-  RCC->AHB2ENR |= RCC_AHB2ENR_GPIOCEN | RCC_AHB2ENR_GPIOGEN;
-  RCC->APB1ENR2 |= RCC_APB1ENR2_LPUART1EN;
-  (void)RCC->APB1ENR2;
-
-  /* PG7 = LPUART1_TX, PG8 = LPUART1_RX, both AF8. */
-  GPIOG->MODER = (GPIOG->MODER & ~(GPIO_MODER_MODE7 | GPIO_MODER_MODE8))
-               | (2U << GPIO_MODER_MODE7_Pos) | (2U << GPIO_MODER_MODE8_Pos);
-  GPIOG->AFR[0] = (GPIOG->AFR[0] & ~GPIO_AFRL_AFSEL7) | (8U << GPIO_AFRL_AFSEL7_Pos);
-  GPIOG->AFR[1] = (GPIOG->AFR[1] & ~GPIO_AFRH_AFSEL8) | (8U << GPIO_AFRH_AFSEL8_Pos);
-
-  /* LPUART1 clocked from PCLK1 (reset default). LPUART: BRR = 256 * fck / baud. */
-  LPUART1->CR1 = 0U;
-  LPUART1->BRR = (uint32_t)(((uint64_t)SystemCoreClock * 256U + UART_BAUD / 2U) / UART_BAUD);
-  LPUART1->CR1 = USART_CR1_TE | USART_CR1_UE;
-}
-
-static void uart_putc(char c)
-{
-  while ((LPUART1->ISR & USART_ISR_TXE_TXFNF) == 0U)
-  {
-  }
-  LPUART1->TDR = (uint8_t)c;
-}
-
-static void uart_puts(const char *s)
-{
-  while (*s != '\0')
-  {
-    if (*s == '\n')
-    {
-      uart_putc('\r');
-    }
-    uart_putc(*s++);
-  }
-}
-
-static void uart_putu(uint32_t v)
-{
-  char buf[11];
-  int i = 0;
-
-  do
-  {
-    buf[i++] = (char)('0' + (v % 10U));
-    v /= 10U;
-  } while (v != 0U);
-
-  while (i > 0)
-  {
-    uart_putc(buf[--i]);
-  }
-}
-
-static void uart_puthex(const uint8_t *p, uint32_t len)
-{
-  static const char hex[] = "0123456789abcdef";
-
-  for (uint32_t i = 0U; i < len; i++)
-  {
-    uart_putc(hex[p[i] >> 4]);
-    uart_putc(hex[p[i] & 0xFU]);
-  }
-}
+#include "bench.h"
+#include "uart.h"
 
 static uint32_t failures;
 
@@ -94,6 +27,8 @@ static void check(const char *what, int ok)
 static void led_init(void)
 {
   /* PC7 = LD1 (green), push-pull output. */
+  RCC->AHB2ENR |= RCC_AHB2ENR_GPIOCEN;
+  (void)RCC->AHB2ENR;
   GPIOC->MODER = (GPIOC->MODER & ~GPIO_MODER_MODE7) | (1U << GPIO_MODER_MODE7_Pos);
 }
 
@@ -157,8 +92,11 @@ int main(void)
   check("MAC_Compute(NULL mac) refused",
         SECURE_MAC_Compute(msg, msg_len, NULL) == SECURE_ERR_PARAM);
 
-  uart_puts(failures == 0U ? "\nAll checks passed. Blinking LD1.\n"
-                           : "\nSome checks FAILED. Blinking LD1.\n");
+  uart_puts(failures == 0U ? "\nAll checks passed.\n" : "\nSome checks FAILED.\n");
+
+  /* ---- M3: latency measurements ---- */
+  bench_run();
+  uart_puts("Benchmark done. Blinking LD1.\n");
 
 #ifdef ISOLATION_TEST
   /* Direct NS read of Secure flash (where the device key lives). The SAU/IDAU

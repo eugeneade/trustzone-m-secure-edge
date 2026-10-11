@@ -30,6 +30,9 @@ uint32_t SECURE_Add(uint32_t a, uint32_t b);
 /* Number of SECURE_Add calls; the counter itself lives in Secure SRAM. */
 uint32_t SECURE_GetCallCount(void);
 
+/* M3: empty Secure function; measures the bare NS -> S -> NS transition cost. */
+void SECURE_Nop(void);
+
 /* M2: crypto service. The device key never leaves the Secure world. */
 
 /* Run the RFC 4231 HMAC-SHA256 known-answer tests inside the Secure world. */

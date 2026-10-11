@@ -10,7 +10,8 @@
  *
  * SAU regions are set by TZ_SAU_Setup() in SystemInit(). This file handles the
  * GTZC (SRAM block-based security) and GPIO pin security, which the SAU does
- * not cover.
+ * not cover, plus platform setup owned by the Secure world: 110 MHz system
+ * clock, instruction cache and the DWT cycle counter used for M3.
  */
 #include <arm_cmse.h>
 #include "stm32l5xx.h"
@@ -119,6 +120,71 @@ void HardFault_Handler(void)
   fault_report("HardFault");
 }
 
+/* ---------------------------- Platform setup ------------------------------ */
+
+/*
+ * SYSCLK = 110 MHz (device maximum) from PLL: MSI 4 MHz / M=1 * N=55 / R=2.
+ * Requires voltage range 0 and 5 flash wait states (RM0438, Table "Number of
+ * wait states according to CPU clock frequency"). AHB/APB prescalers stay /1.
+ */
+static void system_clock_110mhz(void)
+{
+  RCC->APB1ENR1 |= RCC_APB1ENR1_PWREN;
+  (void)RCC->APB1ENR1;
+
+  PWR->CR1 &= ~PWR_CR1_VOS;                     /* VOS = 00: range 0 */
+  while ((PWR->SR2 & PWR_SR2_VOSF) != 0U)
+  {
+  }
+
+  FLASH->ACR = (FLASH->ACR & ~FLASH_ACR_LATENCY) | FLASH_ACR_LATENCY_5WS;
+  while ((FLASH->ACR & FLASH_ACR_LATENCY) != FLASH_ACR_LATENCY_5WS)
+  {
+  }
+
+  RCC->PLLCFGR = RCC_PLLCFGR_PLLSRC_0           /* source: MSI */
+               | (0U  << RCC_PLLCFGR_PLLM_Pos)  /* M = 1 */
+               | (55U << RCC_PLLCFGR_PLLN_Pos)  /* N = 55 -> VCO 220 MHz */
+               | (0U  << RCC_PLLCFGR_PLLR_Pos)  /* R = 2 */
+               | RCC_PLLCFGR_PLLREN;
+  RCC->CR |= RCC_CR_PLLON;
+  while ((RCC->CR & RCC_CR_PLLRDY) == 0U)
+  {
+  }
+
+  /* Switching above 80 MHz goes through AHB /2 for at least 1 us (RM0438 RCC). */
+  RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_HPRE) | (8U << RCC_CFGR_HPRE_Pos);
+  RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW) | (3U << RCC_CFGR_SW_Pos);
+  while ((RCC->CFGR & RCC_CFGR_SWS) != (3U << RCC_CFGR_SWS_Pos))
+  {
+  }
+  for (volatile uint32_t i = 0U; i < 100U; i++)
+  {
+  }
+  RCC->CFGR &= ~RCC_CFGR_HPRE;
+
+  SystemCoreClockUpdate();
+}
+
+/* The ICACHE is left Non-Secure by GTZC (reset default), so it is reached
+ * through its Non-Secure alias. It caches both worlds' flash fetches. */
+static void icache_enable(void)
+{
+  while ((ICACHE_NS->SR & ICACHE_SR_BUSYF) != 0U)
+  {
+  }
+  ICACHE_NS->CR |= ICACHE_CR_EN;
+}
+
+/* DWT cycle counter for M3. It counts in Secure state only while Secure
+ * non-invasive debug is allowed, which is the case at RDP level 0. */
+static void cycle_counter_enable(void)
+{
+  DCB->DEMCR |= DCB_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0U;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
 /* ------------------------------- Boot path -------------------------------- */
 
 static void nonsecure_boot(void)
@@ -137,6 +203,9 @@ int main(void)
   /* Report NS -> S violations as SecureFault rather than escalated HardFault. */
   SCB->SHCSR |= SCB_SHCSR_SECUREFAULTENA_Msk;
 
+  system_clock_110mhz();
+  icache_enable();
+  cycle_counter_enable();
   gtzc_sram_setup();
   board_io_setup();
   nonsecure_boot();
@@ -158,4 +227,8 @@ CMSE_NS_ENTRY uint32_t SECURE_Add(uint32_t a, uint32_t b)
 CMSE_NS_ENTRY uint32_t SECURE_GetCallCount(void)
 {
   return secure_call_count;
+}
+
+CMSE_NS_ENTRY void SECURE_Nop(void)
+{
 }

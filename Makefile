@@ -26,27 +26,34 @@ BUILD := build
 
 ARCH := -mcpu=cortex-m33 -mthumb -mfpu=fpv5-sp-d16 -mfloat-abi=hard
 COMMON_CFLAGS := $(ARCH) -std=c11 -O2 -g3 -Wall -Wextra -ffunction-sections -fdata-sections \
-                 -DSTM32L552xx -I$(DEV)/Include -I$(CORE) -ISecure/Inc
-COMMON_LDFLAGS := $(ARCH) --specs=nano.specs --specs=nosys.specs -Wl,--print-memory-usage
+                 -DSTM32L552xx -I$(DEV)/Include -I$(CORE) -ISecure/Inc -ICommon/Inc \
+                 -I$(MBEDTLS)/include -DMBEDTLS_CONFIG_FILE='"tz_mbedtls_config.h"'
+COMMON_LDFLAGS := $(ARCH) --specs=nano.specs --specs=nosys.specs -Wl,--print-memory-usage -lm
+
+# HMAC-SHA256 and its mbedTLS dependencies, built into both images.
+CRYPTO_SRCS := Common/Src/hmac_sha256.c \
+               $(MBEDTLS)/library/sha256.c \
+               $(MBEDTLS)/library/platform_util.c
 
 # ---- Secure image ----------------------------------------------------------
 S_SRCS := Secure/Src/main.c \
           Secure/Src/crypto_service.c \
-          $(MBEDTLS)/library/sha256.c \
-          $(MBEDTLS)/library/platform_util.c \
+          $(CRYPTO_SRCS) \
           $(DEV)/Source/Templates/system_stm32l5xx_s.c \
           $(DEV)/Source/Templates/gcc/startup_stm32l552xx.s
-S_CFLAGS := $(COMMON_CFLAGS) -mcmse -I$(DEV)/Include/Templates \
-            -I$(MBEDTLS)/include -DMBEDTLS_CONFIG_FILE='"secure_mbedtls_config.h"'
+S_CFLAGS := $(COMMON_CFLAGS) -mcmse -I$(DEV)/Include/Templates
 S_ELF    := $(BUILD)/secure.elf
 S_IMPLIB := $(BUILD)/secure_nsclib.o
 
 # ---- Non-Secure image ------------------------------------------------------
 NS_SRCS := NonSecure/Src/main.c \
+           NonSecure/Src/uart.c \
+           NonSecure/Src/bench.c \
+           $(CRYPTO_SRCS) \
            $(DEV)/Source/Templates/system_stm32l5xx_ns.c \
            $(DEV)/Source/Templates/gcc/startup_stm32l552xx.s
 # ST's system_stm32l5xx_ns.c calls SECURE_SystemCoreClockUpdate() without a prototype.
-NS_CFLAGS := $(COMMON_CFLAGS) -include secure_nsc.h
+NS_CFLAGS := $(COMMON_CFLAGS) -INonSecure/Inc -include secure_nsc.h
 ifeq ($(ISOLATION_TEST),1)
 NS_CFLAGS += -DISOLATION_TEST
 endif
@@ -57,7 +64,7 @@ NS_ELF    := $(BUILD)/nonsecure.elf
 all: $(S_ELF:.elf=.hex) $(NS_ELF:.elf=.hex)
 FORCE_NS:
 
-$(S_ELF) $(S_IMPLIB) &: $(S_SRCS) $(wildcard Secure/Inc/*.h) Makefile
+$(S_ELF) $(S_IMPLIB) &: $(S_SRCS) $(wildcard Secure/Inc/*.h Common/Inc/*.h) Makefile
 	@mkdir -p $(BUILD)
 	$(CC) $(S_CFLAGS) $(S_SRCS) $(COMMON_LDFLAGS) \
 	    -T$(DEV)/Source/Templates/gcc/linker/STM32L552xE_FLASH_s.ld \

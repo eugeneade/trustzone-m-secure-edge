@@ -2,9 +2,9 @@
  * Secure crypto service (M2): HMAC-SHA256 with a device key that never
  * leaves the Secure world.
  *
- * HMAC (RFC 2104) is built on mbedTLS SHA-256 rather than mbedtls_md_hmac_*,
- * which would need a heap in the Secure image. Correctness is checked against
- * the RFC 4231 test vectors by SECURE_CryptoSelfTest().
+ * The HMAC itself is in Common/Src/hmac_sha256.c (shared with the NS
+ * baseline used for M3); SECURE_CryptoSelfTest() checks it against the
+ * RFC 4231 test vectors.
  *
  * Every NSC entry point validates Non-Secure pointers with
  * cmse_check_address_range() before touching them; otherwise the NS app
@@ -14,13 +14,11 @@
 #include <arm_cmse.h>
 #include <stddef.h>
 #include <string.h>
-#include "mbedtls/sha256.h"
+#include "hmac_sha256.h"
 #include "mbedtls/platform_util.h"
 #include "secure_nsc.h"
 
 #define CMSE_NS_ENTRY  __attribute((cmse_nonsecure_entry))
-
-#define SHA256_BLOCK_SIZE  64U
 
 /*
  * Demo device key, stored in Secure flash. A production device would
@@ -31,67 +29,6 @@ static const uint8_t device_key[32] = {
   0x6b, 0x1f, 0x93, 0x0e, 0xc4, 0x57, 0x28, 0xa1, 0x3d, 0x80, 0xf2, 0x5c, 0x19, 0xe6, 0x74, 0xbb,
   0x02, 0x9a, 0x4f, 0xd8, 0x61, 0x37, 0xce, 0x85, 0xe0, 0x2b, 0x7d, 0x46, 0xa9, 0x13, 0xf5, 0x6c
 };
-
-static int hmac_sha256(const uint8_t *key, size_t key_len,
-                       const uint8_t *msg, size_t msg_len,
-                       uint8_t out[SECURE_MAC_SIZE])
-{
-  uint8_t k0[SHA256_BLOCK_SIZE] = {0};
-  uint8_t pad[SHA256_BLOCK_SIZE];
-  uint8_t inner[SECURE_MAC_SIZE];
-  mbedtls_sha256_context ctx;
-  int ret;
-
-  /* K0: keys longer than the block size are hashed first, shorter ones zero-padded. */
-  if (key_len > SHA256_BLOCK_SIZE)
-  {
-    ret = mbedtls_sha256(key, key_len, k0, 0);
-    if (ret != 0)
-    {
-      goto cleanup_keys;
-    }
-  }
-  else
-  {
-    memcpy(k0, key, key_len);
-  }
-
-  mbedtls_sha256_init(&ctx);
-
-  /* inner = H((K0 ^ ipad) || msg) */
-  for (size_t i = 0U; i < SHA256_BLOCK_SIZE; i++)
-  {
-    pad[i] = k0[i] ^ 0x36U;
-  }
-  if ((ret = mbedtls_sha256_starts(&ctx, 0)) != 0 ||
-      (ret = mbedtls_sha256_update(&ctx, pad, sizeof(pad))) != 0 ||
-      (ret = mbedtls_sha256_update(&ctx, msg, msg_len)) != 0 ||
-      (ret = mbedtls_sha256_finish(&ctx, inner)) != 0)
-  {
-    goto cleanup;
-  }
-
-  /* out = H((K0 ^ opad) || inner) */
-  for (size_t i = 0U; i < SHA256_BLOCK_SIZE; i++)
-  {
-    pad[i] = k0[i] ^ 0x5cU;
-  }
-  if ((ret = mbedtls_sha256_starts(&ctx, 0)) != 0 ||
-      (ret = mbedtls_sha256_update(&ctx, pad, sizeof(pad))) != 0 ||
-      (ret = mbedtls_sha256_update(&ctx, inner, sizeof(inner))) != 0 ||
-      (ret = mbedtls_sha256_finish(&ctx, out)) != 0)
-  {
-    goto cleanup;
-  }
-
-cleanup:
-  mbedtls_sha256_free(&ctx);
-  mbedtls_platform_zeroize(inner, sizeof(inner));
-cleanup_keys:
-  mbedtls_platform_zeroize(k0, sizeof(k0));
-  mbedtls_platform_zeroize(pad, sizeof(pad));
-  return ret;
-}
 
 /* Returns 0 iff equal; run time does not depend on where the buffers differ. */
 static uint32_t ct_compare(const uint8_t *a, const volatile uint8_t *b, size_t len)
