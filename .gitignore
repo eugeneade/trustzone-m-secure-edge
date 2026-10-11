@@ -7,3 +7,5 @@ Release/
 *.hex
 .settings/
 __pycache__/
+build/
+.claude/

@@ -31,7 +31,7 @@ latency and resources.
 ## Milestones
 | # | Milestone | Status |
 |---|-----------|--------|
-| M1 | Hello TrustZone: Non-Secure app calls a Secure function | Not started |
+| M1 | Hello TrustZone: Non-Secure app calls a Secure function | Done |
 | M2 | Secure crypto service: key isolated in Secure world | Not started |
 | M3 | Measure Secure-call and crypto overhead (cycles, us) | Not started |
 
