@@ -64,6 +64,63 @@ static void board_io_setup(void)
   GPIOG->SECCFGR &= ~(GPIO_SECCFGR_SEC7 | GPIO_SECCFGR_SEC8);
 }
 
+/* ------------------------------ Fault report ------------------------------ */
+
+/* Minimal polled output on LPUART1, which the NS app owns and has already
+ * initialised by the time any fault can occur. Secure code reaches it through
+ * its Non-Secure alias. */
+static void fault_puts(const char *s)
+{
+  while (*s != '\0')
+  {
+    while ((LPUART1_NS->ISR & USART_ISR_TXE_TXFNF) == 0U)
+    {
+    }
+    LPUART1_NS->TDR = (uint8_t)*s++;
+  }
+}
+
+static void fault_puthex(uint32_t v)
+{
+  static const char hex[] = "0123456789ABCDEF";
+  char buf[11] = "0x";
+
+  for (int i = 0; i < 8; i++)
+  {
+    buf[2 + i] = hex[(v >> (28 - 4 * i)) & 0xFU];
+  }
+  buf[10] = '\0';
+  fault_puts(buf);
+}
+
+static void fault_report(const char *name)
+{
+  fault_puts("\r\n*** Secure world caught ");
+  fault_puts(name);
+  fault_puts(": SFSR=");
+  fault_puthex(SAU->SFSR);
+  fault_puts(" SFAR=");
+  fault_puthex(SAU->SFAR);
+  fault_puts(" HFSR=");
+  fault_puthex(SCB->HFSR);
+  fault_puts("\r\n*** Non-Secure access to Secure memory was blocked. Halting.\r\n");
+  for (;;)
+  {
+  }
+}
+
+void SecureFault_Handler(void)
+{
+  fault_report("SecureFault");
+}
+
+void HardFault_Handler(void)
+{
+  fault_report("HardFault");
+}
+
+/* ------------------------------- Boot path -------------------------------- */
+
 static void nonsecure_boot(void)
 {
   const uint32_t *ns_vectors = (const uint32_t *)NS_VTOR_BASE;
@@ -77,6 +134,9 @@ static void nonsecure_boot(void)
 
 int main(void)
 {
+  /* Report NS -> S violations as SecureFault rather than escalated HardFault. */
+  SCB->SHCSR |= SCB_SHCSR_SECUREFAULTENA_Msk;
+
   gtzc_sram_setup();
   board_io_setup();
   nonsecure_boot();

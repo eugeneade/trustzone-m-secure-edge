@@ -10,6 +10,17 @@
 
 #include <stdint.h>
 
+#define SECURE_MAC_SIZE  32U   /* HMAC-SHA256 tag length in bytes */
+
+typedef enum
+{
+  SECURE_OK            = 0,
+  SECURE_ERR_PARAM     = 1,   /* NULL pointer or buffer not fully Non-Secure */
+  SECURE_ERR_MAC       = 2,   /* MAC verification failed */
+  SECURE_ERR_SELFTEST  = 3,   /* known-answer test failed */
+  SECURE_ERR_INTERNAL  = 4
+} secure_status_t;
+
 /* Provided by system_stm32l5xx_s.c (ST template). */
 uint32_t SECURE_SystemCoreClockUpdate(void);
 
@@ -18,5 +29,18 @@ uint32_t SECURE_Add(uint32_t a, uint32_t b);
 
 /* Number of SECURE_Add calls; the counter itself lives in Secure SRAM. */
 uint32_t SECURE_GetCallCount(void);
+
+/* M2: crypto service. The device key never leaves the Secure world. */
+
+/* Run the RFC 4231 HMAC-SHA256 known-answer tests inside the Secure world. */
+secure_status_t SECURE_CryptoSelfTest(void);
+
+/* mac = HMAC-SHA256(device_key, msg[0..len)). Both buffers must be Non-Secure. */
+secure_status_t SECURE_MAC_Compute(const uint8_t *msg, uint32_t len,
+                                   uint8_t mac[SECURE_MAC_SIZE]);
+
+/* Constant-time check of mac against HMAC-SHA256(device_key, msg). */
+secure_status_t SECURE_MAC_Verify(const uint8_t *msg, uint32_t len,
+                                  const uint8_t mac[SECURE_MAC_SIZE]);
 
 #endif /* SECURE_NSC_H */
