@@ -14,6 +14,7 @@
 #include <arm_cmse.h>
 #include <stddef.h>
 #include <string.h>
+#include "stm32l5xx.h"
 #include "hmac_sha256.h"
 #include "mbedtls/platform_util.h"
 #include "secure_nsc.h"
@@ -40,6 +41,23 @@ static uint32_t ct_compare(const uint8_t *a, const volatile uint8_t *b, size_t l
     diff |= (uint32_t)(a[i] ^ b[i]);
   }
   return diff;
+}
+
+/*
+ * Erase a 4-byte-aligned Secure buffer one word at a time (len a multiple of 4).
+ * Volatile stores cannot be optimised away. M4 found the generic
+ * mbedtls_platform_zeroize -> newlib-nano memset path clears one byte per
+ * loop iteration, which made it the largest cost of SECURE_MAC_Compute.
+ */
+static void zeroize_words(void *buf, size_t len)
+{
+  volatile uint32_t *w = (volatile uint32_t *)buf;
+
+  for (size_t i = 0U; i < len / 4U; i++)
+  {
+    w[i] = 0U;
+  }
+  __asm volatile ("" ::: "memory");
 }
 
 /* True if [p, p+len) is entirely Non-Secure and accessible with the given MPU flags. */
@@ -79,7 +97,7 @@ CMSE_NS_ENTRY secure_status_t SECURE_CryptoSelfTest(void)
   };
 
   uint8_t key[131];
-  uint8_t mac[SECURE_MAC_SIZE];
+  uint8_t mac[SECURE_MAC_SIZE] __attribute__((aligned(4)));
   uint32_t fail = 0U;
 
   memset(key, 0x0b, 20);
@@ -93,14 +111,14 @@ CMSE_NS_ENTRY secure_status_t SECURE_CryptoSelfTest(void)
   fail |= (uint32_t)hmac_sha256(key, sizeof(key), tc6_data, sizeof(tc6_data) - 1U, mac);
   fail |= ct_compare(mac, tc6_mac, sizeof(mac));
 
-  mbedtls_platform_zeroize(mac, sizeof(mac));
+  zeroize_words(mac, sizeof(mac));
   return (fail == 0U) ? SECURE_OK : SECURE_ERR_SELFTEST;
 }
 
 CMSE_NS_ENTRY secure_status_t SECURE_MAC_Compute(const uint8_t *msg, uint32_t len,
                                                  uint8_t mac[SECURE_MAC_SIZE])
 {
-  uint8_t tag[SECURE_MAC_SIZE];
+  uint8_t tag[SECURE_MAC_SIZE] __attribute__((aligned(4)));
 
   if (!ns_buffer_ok(msg, len, CMSE_MPU_READ) ||
       mac == NULL || !ns_buffer_ok(mac, SECURE_MAC_SIZE, CMSE_MPU_READWRITE))
@@ -111,18 +129,18 @@ CMSE_NS_ENTRY secure_status_t SECURE_MAC_Compute(const uint8_t *msg, uint32_t le
   /* Compute into Secure memory, then copy out, so a failure never leaves a partial tag. */
   if (hmac_sha256(device_key, sizeof(device_key), msg, len, tag) != 0)
   {
-    mbedtls_platform_zeroize(tag, sizeof(tag));
+    zeroize_words(tag, sizeof(tag));
     return SECURE_ERR_INTERNAL;
   }
   memcpy(mac, tag, sizeof(tag));
-  mbedtls_platform_zeroize(tag, sizeof(tag));
+  zeroize_words(tag, sizeof(tag));
   return SECURE_OK;
 }
 
 CMSE_NS_ENTRY secure_status_t SECURE_MAC_Verify(const uint8_t *msg, uint32_t len,
                                                 const uint8_t mac[SECURE_MAC_SIZE])
 {
-  uint8_t tag[SECURE_MAC_SIZE];
+  uint8_t tag[SECURE_MAC_SIZE] __attribute__((aligned(4)));
   secure_status_t status;
 
   if (!ns_buffer_ok(msg, len, CMSE_MPU_READ) ||
@@ -139,6 +157,98 @@ CMSE_NS_ENTRY secure_status_t SECURE_MAC_Verify(const uint8_t *msg, uint32_t len
   {
     status = (ct_compare(tag, mac, sizeof(tag)) == 0U) ? SECURE_OK : SECURE_ERR_MAC;
   }
-  mbedtls_platform_zeroize(tag, sizeof(tag));
+  zeroize_words(tag, sizeof(tag));
   return status;
+}
+
+/* ------------------------- M4 measurement probes -------------------------- */
+/*
+ * Each probe performs one more step of SECURE_MAC_Compute than the previous
+ * one, in the same order, so the difference between consecutive probes is the
+ * cost of that step. Measurement-only entry points: a production build would
+ * leave them out.
+ */
+
+CMSE_NS_ENTRY secure_status_t SECURE_Probe_Args(const uint8_t *msg, uint32_t len,
+                                                uint8_t mac[SECURE_MAC_SIZE])
+{
+  (void)msg;
+  (void)len;
+  (void)mac;
+  return SECURE_OK;
+}
+
+CMSE_NS_ENTRY secure_status_t SECURE_Probe_Checks(const uint8_t *msg, uint32_t len,
+                                                  uint8_t mac[SECURE_MAC_SIZE])
+{
+  if (!ns_buffer_ok(msg, len, CMSE_MPU_READ) ||
+      mac == NULL || !ns_buffer_ok(mac, SECURE_MAC_SIZE, CMSE_MPU_READWRITE))
+  {
+    return SECURE_ERR_PARAM;
+  }
+  return SECURE_OK;
+}
+
+/* Cycles spent in hmac_sha256() alone, timed inside the Secure world. */
+CMSE_NS_ENTRY uint32_t SECURE_Probe_HmacCycles(const uint8_t *msg, uint32_t len,
+                                               uint8_t mac[SECURE_MAC_SIZE])
+{
+  uint8_t tag[SECURE_MAC_SIZE] __attribute__((aligned(4)));
+
+  if (!ns_buffer_ok(msg, len, CMSE_MPU_READ) ||
+      mac == NULL || !ns_buffer_ok(mac, SECURE_MAC_SIZE, CMSE_MPU_READWRITE))
+  {
+    return 0U;
+  }
+
+  uint32_t t0 = DWT->CYCCNT;
+  int ret = hmac_sha256(device_key, sizeof(device_key), msg, len, tag);
+  uint32_t t1 = DWT->CYCCNT;
+
+  zeroize_words(tag, sizeof(tag));
+  return (ret == 0) ? (t1 - t0) : 0U;
+}
+
+/*
+ * SECURE_MAC_Compute with each step timed inside the Secure world, so the
+ * steps add up exactly (no cross-world call overhead in any of them).
+ * steps[] receives cycles for: pointer checks, HMAC, copy-out, zeroize, and
+ * (for comparison only) the previous mbedtls_platform_zeroize on a same-size
+ * buffer.
+ */
+CMSE_NS_ENTRY secure_status_t SECURE_Probe_MacSteps(const uint8_t *msg, uint32_t len,
+                                                    uint8_t mac[SECURE_MAC_SIZE],
+                                                    uint32_t steps[SECURE_PROBE_STEPS])
+{
+  uint8_t tag[SECURE_MAC_SIZE] __attribute__((aligned(4)));
+  uint8_t old[SECURE_MAC_SIZE] __attribute__((aligned(4)));
+
+  if (steps == NULL ||
+      !ns_buffer_ok(steps, SECURE_PROBE_STEPS * sizeof(uint32_t), CMSE_MPU_READWRITE))
+  {
+    return SECURE_ERR_PARAM;
+  }
+
+  uint32_t t0 = DWT->CYCCNT;
+  if (!ns_buffer_ok(msg, len, CMSE_MPU_READ) ||
+      mac == NULL || !ns_buffer_ok(mac, SECURE_MAC_SIZE, CMSE_MPU_READWRITE))
+  {
+    return SECURE_ERR_PARAM;
+  }
+  uint32_t t1 = DWT->CYCCNT;
+  int ret = hmac_sha256(device_key, sizeof(device_key), msg, len, tag);
+  uint32_t t2 = DWT->CYCCNT;
+  memcpy(mac, tag, sizeof(tag));
+  uint32_t t3 = DWT->CYCCNT;
+  zeroize_words(tag, sizeof(tag));
+  uint32_t t4 = DWT->CYCCNT;
+  mbedtls_platform_zeroize(old, sizeof(old));
+  uint32_t t5 = DWT->CYCCNT;
+
+  steps[0] = t1 - t0;
+  steps[1] = t2 - t1;
+  steps[2] = t3 - t2;
+  steps[3] = t4 - t3;
+  steps[4] = t5 - t4;
+  return (ret == 0) ? SECURE_OK : SECURE_ERR_INTERNAL;
 }

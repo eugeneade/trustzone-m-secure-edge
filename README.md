@@ -1,6 +1,6 @@
 # TrustZone-M Secure Edge Prototype
 
-**Status: M1–M3 complete**
+**Status: M1–M4 complete**
 
 How much does hardware-enforced isolation cost on a real-time embedded processor?
 This project builds a small secure communication service on an ARM Cortex-M33 with
@@ -40,6 +40,7 @@ application. The application reaches the Secure world only through Non-Secure Ca
 | `SECURE_CryptoSelfTest` | RFC 4231 known-answer tests (cases 1, 2, 6) |
 | `SECURE_Nop` | Empty call, used to time the bare world switch |
 | `SECURE_Add`, `SECURE_GetCallCount` | M1 round-trip checks |
+| `SECURE_Probe_*` | M4 measurement-only probes (would be left out of a production build) |
 
 Every buffer passed in by the Non-Secure application is checked with
 `cmse_check_address_range` before use. Without that check the application could make the
@@ -63,6 +64,7 @@ watermarks (option bytes) and GPIO pin security.
 | M1 | Hello TrustZone: Non-Secure app calls a Secure function | Done |
 | M2 | Secure crypto service: key isolated in Secure world | Done |
 | M3 | Measure Secure-call and crypto overhead (cycles, us) | Done |
+| M4 | Explain the Secure-service overhead step by step, fix its largest cost | Done |
 
 **M2 verification on the board:** all functional checks pass (self-test, MAC accepted,
 tampered message and tampered MAC rejected, Secure pointers refused). The device MAC was
@@ -71,6 +73,7 @@ the Non-Secure app reads Secure flash directly. The hardware blocks the read and
 SecureFault (`SFSR=0x48`, attribution unit violation, `SFAR=0x0C000000`).
 
 ## Results
+### M3: cost of the Secure world
 SYSCLK 110 MHz, instruction cache on, GCC `-O2`. Each row: 1000 timed runs after 10
 warm-up runs, interrupts masked, DWT cycle counter. Two independent runs gave identical
 results (`results/m3_20261011_*.csv`).
@@ -89,7 +92,7 @@ results (`results/m3_20261011_*.csv`).
 | HMAC-SHA256 in Non-Secure | 1024 | 109769 | 997.90 | 109769 | 109769 | 1000 |
 | HMAC-SHA256 via Secure service | 1024 | 110408 | 1003.71 | 110408 | 110409 | 1000 |
 
-**Derived cost of the Secure world**
+**Derived cost of the Secure world** (M3 baseline, before the M4 fix)
 
 | Quantity | Cycles | us | Share of HMAC time |
 |----------|-------:|---:|-------------------:|
@@ -99,19 +102,55 @@ results (`results/m3_20261011_*.csv`).
 | Same, 256 B | 639 | 5.81 | 1.3% |
 | Same, 1024 B | 639 | 5.81 | 0.6% |
 
-**Findings so far**
+**M3 findings**
 - The world switch itself is cheap: 38 extra cycles (0.35 us) for a round trip into the
   Secure world and back.
-- Running HMAC in the Secure service costs a fixed 639 cycles (5.8 us) more than the same
+- Running HMAC in the Secure service cost a fixed 639 cycles (5.8 us) more than the same
   code in the Non-Secure world, at every message size. The overhead is per call, not per
   byte, so its share shrinks as messages grow: 2.4% at 16 B, 0.6% at 1 KB.
-- About 600 of those 639 cycles are not the world switch. They come from the service's
-  own work around the HMAC, such as pointer validation, copying the tag out through a
-  Secure buffer and zeroizing it, and possibly code placement. That cost has not been
-  broken down yet.
-- The SHA-256 computation dominates: about 81 cycles per extra byte in software, against a
-  639-cycle fixed overhead for isolation. That points to hardware crypto acceleration as
-  the bigger lever, not the isolation.
+- About 600 of those 639 cycles were not the world switch. M4 explains them.
+- The SHA-256 computation dominates: about 81 cycles per extra byte in software. That
+  points to hardware crypto acceleration as the bigger lever, not the isolation.
+
+### M4: where the Secure-service overhead goes
+Each step of `SECURE_MAC_Compute` was timed with the cycle counter from inside the Secure
+world, so the steps add up without cross-world call costs. The HMAC itself was also timed
+from inside each world. Same settings as M3; two runs after the fix gave identical
+results (`results/bench_20261031_165904.csv`, `results/bench_20261031_165941.csv`).
+The before-fix run is `results/bench_20261031_165713.csv`.
+
+| Step (64 B message, medians) | Before fix | After fix |
+|------------------------------|-----------:|----------:|
+| World switch (empty Secure call minus empty Non-Secure call) | 38 | 38 |
+| Passing three arguments | 4 | 4 |
+| Pointer checks (`cmse_check_address_range` ×2) | 93 | 96 |
+| Copying the 32-byte tag out | 16 | 19 |
+| Zeroizing the 32-byte tag | **250** | **35** |
+| HMAC core, Secure minus Non-Secure | 1 | 8 |
+| Sum of steps | 402 | 200 |
+| **Measured total (Secure service minus same HMAC in Non-Secure)** | **404** | **226** |
+| Unexplained residual | 2 | 26 |
+
+The step costs are identical at 1024 B: none of them depends on message size.
+
+**M4 findings**
+- **The hardware isolation is a small part of the cost.** The world switch plus argument
+  passing is 42 cycles. Before the fix, 62% of the overhead was zeroizing one 32-byte tag.
+- **Cause:** `mbedtls_platform_zeroize` calls newlib-nano's size-optimized `memset`, which
+  clears one byte per loop iteration (about 7.8 cycles per byte). Replacing it with a
+  word-at-a-time volatile zeroize for the Secure service's tag buffers cut that step from
+  249 to 35 cycles, measured in the same build. The end-to-end overhead fell from 404 to
+  226 cycles (−44%), now 0.21–0.84% of the HMAC time.
+- **The same HMAC code runs equally fast in both worlds.** Timed from inside each world,
+  the HMAC core differs by 1–8 cycles out of 32,000+.
+- **Pointer validation is now the largest step** at 96 cycles: two calls to the generic
+  `cmse_check_address_range` library routine.
+- **Code placement matters.** Between the M3 build and the first M4 build,
+  `SECURE_MAC_Compute` did not change, yet its measured overhead moved from 639 to 404
+  cycles because other code moved in flash. Step timings also shift by a few cycles
+  between builds. Cross-build comparisons need that caveat; within-build comparisons (as
+  used for the zeroize fix) are more reliable. The cause of the 235-cycle shift has not
+  been isolated. The byte-wise `memset` loop is a plausible suspect.
 
 **Method notes and caveats**
 - Each operation runs through the same function-pointer harness, and each wrapper makes
@@ -157,22 +196,30 @@ make ISOLATION_TEST=1 flash   # optional: show a direct NS read of Secure flash 
 ```
 
 `capture.ps1` saves the transcript to `results/raw/`, the CSV to `results/`, and a
-Markdown summary with the derived overheads.
+Markdown summary with the derived overheads and the M4 step breakdown. Runs
+before M4 are named `m3_*`, later ones `bench_*`.
 
 ## Repository layout
 - `Secure/` Secure-world firmware: partition setup, clocks, crypto service, NSC API (`Inc/secure_nsc.h`)
-- `NonSecure/` Non-Secure application: functional checks and the M3 benchmark
+- `NonSecure/` Non-Secure application: functional checks and the M3/M4 benchmark
 - `Common/` HMAC-SHA256 and mbedTLS configuration, built into both images
 - `third_party/` Git submodules: CMSIS device and core headers, mbedTLS
 - `results/` Benchmark CSVs and summaries, raw UART logs, capture script
 - `docs/` Milestone notes and write-ups
 
 ## Next steps
-- Break down the fixed 639-cycle cost of the Secure MAC service: pointer checks, copy-out
-  and zeroization, code placement.
-- Compare with the STM32L5 hardware HASH accelerator, to weigh isolation cost against
-  acceleration gain.
-- Measure cold-cache, first-call latency.
+- **Interrupt latency during Secure calls:** the worst-case delay to a Non-Secure interrupt
+  while the CPU is inside the Secure service. This matters more than the average for
+  real-time autonomous systems.
+- **Hardware vs software crypto:** compare the STM32L5 HASH accelerator with software
+  SHA-256, and what sharing that peripheral between the worlds costs.
+- **Remaining hygiene costs:** `hmac_sha256` itself zeroizes 160 bytes of key material
+  with the same byte-wise `memset` in both worlds. Also compare newlib-nano with full
+  newlib, whose `memset`/`memcpy` work a word at a time.
+- **Pointer checks:** see whether a specialised check for the single SAU layout used here
+  can undercut the generic 96-cycle `cmse_check_address_range` path without weakening it.
+- **Code-placement sensitivity:** isolate the cause of the 639 to 404 cycle shift.
+- **Cold-cache, first-call latency.**
 
 ## Author
 Eugene Olowofela, P.Eng

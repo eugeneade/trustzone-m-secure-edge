@@ -67,6 +67,18 @@ __attribute__((noinline, noipa)) static void op_hmac_nsc(uint32_t len)
   (void)SECURE_MAC_Compute(msg, len, mac);
 }
 
+/* M4: Secure probes, each one more step of SECURE_MAC_Compute. */
+__attribute__((noinline, noipa)) static void op_probe_args(uint32_t len)
+{
+  (void)SECURE_Probe_Args(msg, len, mac);
+}
+
+__attribute__((noinline, noipa)) static void op_probe_checks(uint32_t len)
+{
+  (void)SECURE_Probe_Checks(msg, len, mac);
+}
+
+
 /* ----------------------------- Measurement -------------------------------- */
 
 static void measure(bench_op_t op, uint32_t len)
@@ -85,6 +97,63 @@ static void measure(bench_op_t op, uint32_t len)
     samples[i] = t1 - t0;
   }
   __enable_irq();
+}
+
+/* hmac_sha256() alone, timed around the call inside each world, so call and
+ * world-switch costs are excluded. Compares the same code in S and NS. */
+static void measure_hmac_core(int secure, uint32_t len)
+{
+  for (uint32_t i = 0U; i < BENCH_WARMUP; i++)
+  {
+    (void)hmac_sha256(ns_key, sizeof(ns_key), msg, len, mac);
+    (void)SECURE_Probe_HmacCycles(msg, len, mac);
+  }
+
+  __disable_irq();
+  for (uint32_t i = 0U; i < BENCH_RUNS; i++)
+  {
+    if (secure)
+    {
+      samples[i] = SECURE_Probe_HmacCycles(msg, len, mac);
+    }
+    else
+    {
+      uint32_t t0 = DWT->CYCCNT;
+      (void)hmac_sha256(ns_key, sizeof(ns_key), msg, len, mac);
+      uint32_t t1 = DWT->CYCCNT;
+      samples[i] = t1 - t0;
+    }
+  }
+  __enable_irq();
+}
+
+static void report(const char *op, uint32_t len);
+
+/* Steps of SECURE_MAC_Compute timed inside the Secure world. One pass per
+ * step keeps a single samples[] buffer; every pass runs the full function. */
+static void measure_mac_steps(uint32_t len)
+{
+  static const char *const names[SECURE_PROBE_STEPS] = {
+    "step_checks", "step_hmac", "step_copy", "step_zeroize", "step_zeroize_mbedtls"
+  };
+  uint32_t steps[SECURE_PROBE_STEPS];
+
+  for (uint32_t i = 0U; i < BENCH_WARMUP; i++)
+  {
+    (void)SECURE_Probe_MacSteps(msg, len, mac, steps);
+  }
+
+  for (uint32_t k = 0U; k < SECURE_PROBE_STEPS; k++)
+  {
+    __disable_irq();
+    for (uint32_t i = 0U; i < BENCH_RUNS; i++)
+    {
+      (void)SECURE_Probe_MacSteps(msg, len, mac, steps);
+      samples[i] = steps[k];
+    }
+    __enable_irq();
+    report(names[k], len);
+  }
 }
 
 /* Back-to-back counter reads: the fixed cost of the timing itself. */
@@ -177,7 +246,9 @@ void bench_run(void)
 
   /* The timed loop ignores return codes, so make sure the ops really succeed. */
   if (hmac_sha256(ns_key, sizeof(ns_key), msg, MSG_MAX, mac) != 0 ||
-      SECURE_MAC_Compute(msg, MSG_MAX, mac) != SECURE_OK)
+      SECURE_MAC_Compute(msg, MSG_MAX, mac) != SECURE_OK ||
+      SECURE_Probe_HmacCycles(msg, MSG_MAX, mac) == 0U ||
+      SECURE_Probe_MacSteps(msg, MSG_MAX, mac, (uint32_t[SECURE_PROBE_STEPS]){0}) != SECURE_OK)
   {
     uart_puts("\nM3: benchmark aborted, HMAC operation failed\n");
     return;
@@ -210,6 +281,29 @@ void bench_run(void)
 
     measure(op_hmac_nsc, sizes[s]);
     report("hmac_nsc", sizes[s]);
+  }
+
+  /* M4: break the fixed Secure-service overhead into its steps. Two sizes
+   * show whether any step depends on message length. */
+  static const uint32_t probe_sizes[] = {64U, 1024U};
+
+  for (uint32_t s = 0U; s < sizeof(probe_sizes) / sizeof(probe_sizes[0]); s++)
+  {
+    uint32_t len = probe_sizes[s];
+
+    measure(op_probe_args, len);
+    report("probe_args", len);
+
+    measure(op_probe_checks, len);
+    report("probe_checks", len);
+
+    measure_mac_steps(len);
+
+    measure_hmac_core(0, len);
+    report("hmac_core_ns", len);
+
+    measure_hmac_core(1, len);
+    report("hmac_core_s", len);
   }
 
   uart_puts("# end\n");

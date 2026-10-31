@@ -46,4 +46,23 @@ secure_status_t SECURE_MAC_Compute(const uint8_t *msg, uint32_t len,
 secure_status_t SECURE_MAC_Verify(const uint8_t *msg, uint32_t len,
                                   const uint8_t mac[SECURE_MAC_SIZE]);
 
+/* M4: measurement-only probes. Each adds one step of SECURE_MAC_Compute:
+ * argument passing, pointer checks. */
+secure_status_t SECURE_Probe_Args(const uint8_t *msg, uint32_t len,
+                                  uint8_t mac[SECURE_MAC_SIZE]);
+secure_status_t SECURE_Probe_Checks(const uint8_t *msg, uint32_t len,
+                                    uint8_t mac[SECURE_MAC_SIZE]);
+
+/* Cycles of hmac_sha256() alone, timed inside the Secure world (0 on error). */
+uint32_t SECURE_Probe_HmacCycles(const uint8_t *msg, uint32_t len,
+                                 uint8_t mac[SECURE_MAC_SIZE]);
+
+/* SECURE_MAC_Compute with each step timed inside the Secure world:
+ * steps[] = cycles for pointer checks, HMAC, copy-out, zeroize, and the
+ * former mbedtls_platform_zeroize on a same-size buffer (comparison only). */
+#define SECURE_PROBE_STEPS  5U
+secure_status_t SECURE_Probe_MacSteps(const uint8_t *msg, uint32_t len,
+                                      uint8_t mac[SECURE_MAC_SIZE],
+                                      uint32_t steps[SECURE_PROBE_STEPS]);
+
 #endif /* SECURE_NSC_H */
