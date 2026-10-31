@@ -49,6 +49,7 @@ S_IMPLIB := $(BUILD)/secure_nsclib.o
 NS_SRCS := NonSecure/Src/main.c \
            NonSecure/Src/uart.c \
            NonSecure/Src/bench.c \
+           NonSecure/Src/irq_latency.c \
            $(CRYPTO_SRCS) \
            $(DEV)/Source/Templates/system_stm32l5xx_ns.c \
            $(DEV)/Source/Templates/gcc/startup_stm32l552xx.s

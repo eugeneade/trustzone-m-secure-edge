@@ -2,13 +2,15 @@
  * Non-Secure world: application side of the Secure crypto service.
  *
  * Exercises the Secure world through the NSC veneers (M1 round trip, M2 MAC
- * service and pointer validation), then runs the M3 benchmark. Results go to
+ * service and pointer validation), then runs the M3/M4 call benchmarks and the
+ * M5 interrupt-latency benchmark. Results go to
  * the ST-LINK virtual COM port (see uart.h).
  */
 #include <stddef.h>
 #include "stm32l5xx.h"
 #include "secure_nsc.h"
 #include "bench.h"
+#include "irq_latency.h"
 #include "uart.h"
 
 static uint32_t failures;
@@ -94,8 +96,12 @@ int main(void)
 
   uart_puts(failures == 0U ? "\nAll checks passed.\n" : "\nSome checks FAILED.\n");
 
-  /* ---- M3: latency measurements ---- */
+  /* ---- M3/M4: call and HMAC latency ---- */
   bench_run();
+
+  /* ---- M5: interrupt latency ---- */
+  irq_latency_run();
+  uart_puts("# end\n");
   uart_puts("Benchmark done. Blinking LD1.\n");
 
 #ifdef ISOLATION_TEST

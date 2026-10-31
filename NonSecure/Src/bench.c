@@ -172,18 +172,18 @@ static void measure_timer_only(void)
 
 /* ------------------------------- Reporting -------------------------------- */
 
-static void sort_samples(void)
+static void sort_buf(uint32_t *buf, uint32_t n)
 {
-  for (uint32_t i = 1U; i < BENCH_RUNS; i++)
+  for (uint32_t i = 1U; i < n; i++)
   {
-    uint32_t v = samples[i];
+    uint32_t v = buf[i];
     uint32_t j = i;
-    while (j > 0U && samples[j - 1U] > v)
+    while (j > 0U && buf[j - 1U] > v)
     {
-      samples[j] = samples[j - 1U];
+      buf[j] = buf[j - 1U];
       j--;
     }
-    samples[j] = v;
+    buf[j] = v;
   }
 }
 
@@ -195,44 +195,49 @@ static void put_x10(uint32_t v)
   uart_putc((char)('0' + (v % 10U)));
 }
 
-static void report(const char *op, uint32_t len)
+void bench_report(const char *op, uint32_t len, uint32_t *buf, uint32_t n)
 {
   uint64_t sum = 0U;
 
-  for (uint32_t i = 0U; i < BENCH_RUNS; i++)
+  for (uint32_t i = 0U; i < n; i++)
   {
-    sum += samples[i];
+    sum += buf[i];
   }
-  float mean = (float)sum / (float)BENCH_RUNS;
+  float mean = (float)sum / (float)n;
 
   float var = 0.0f;
-  for (uint32_t i = 0U; i < BENCH_RUNS; i++)
+  for (uint32_t i = 0U; i < n; i++)
   {
-    float d = (float)samples[i] - mean;
+    float d = (float)buf[i] - mean;
     var += d * d;
   }
-  float stddev = sqrtf(var / (float)(BENCH_RUNS - 1U));
+  float stddev = sqrtf(var / (float)(n - 1U));
 
-  sort_samples();
-  /* Even run count: median is the mean of the two middle samples. */
-  uint32_t median_x10 = (samples[BENCH_RUNS / 2U - 1U] + samples[BENCH_RUNS / 2U]) * 5U;
+  sort_buf(buf, n);
+  uint32_t median_x10 = ((n % 2U) != 0U) ? buf[n / 2U] * 10U
+                                         : (buf[n / 2U - 1U] + buf[n / 2U]) * 5U;
 
   uart_puts(op);
   uart_putc(',');
   uart_putu(len);
   uart_putc(',');
-  uart_putu(BENCH_RUNS);
+  uart_putu(n);
   uart_putc(',');
-  uart_putu(samples[0]);
+  uart_putu(buf[0]);
   uart_putc(',');
   put_x10(median_x10);
   uart_putc(',');
   put_x10((uint32_t)(mean * 10.0f + 0.5f));
   uart_putc(',');
-  uart_putu(samples[BENCH_RUNS - 1U]);
+  uart_putu(buf[n - 1U]);
   uart_putc(',');
   put_x10((uint32_t)(stddev * 10.0f + 0.5f));
   uart_puts("\n");
+}
+
+static void report(const char *op, uint32_t len)
+{
+  bench_report(op, len, samples, BENCH_RUNS);
 }
 
 void bench_run(void)
@@ -305,6 +310,4 @@ void bench_run(void)
     measure_hmac_core(1, len);
     report("hmac_core_s", len);
   }
-
-  uart_puts("# end\n");
 }

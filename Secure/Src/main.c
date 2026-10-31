@@ -120,6 +120,14 @@ void HardFault_Handler(void)
   fault_report("HardFault");
 }
 
+/* All interrupts target the Secure world at reset (partition_stm32l552xx.h
+ * sets every ITNS bit to 0). Hand over the ones the NS app owns:
+ *   TIM2  M5 interrupt-latency timer */
+static void nvic_route_to_ns(void)
+{
+  NVIC_SetTargetState(TIM2_IRQn);
+}
+
 /* ---------------------------- Platform setup ------------------------------ */
 
 /*
@@ -208,6 +216,7 @@ int main(void)
   cycle_counter_enable();
   gtzc_sram_setup();
   board_io_setup();
+  nvic_route_to_ns();
   nonsecure_boot();
 
   /* Not reached: the NS app never returns. */

@@ -1,0 +1,65 @@
+﻿
+=== TrustZone Secure Edge (Non-Secure world) ===
+SystemCoreClock = 110000000 Hz (read via NSC call)
+
+M1: NS -> S -> NS calls
+  [OK]   SECURE_Add(2, 3) == 5
+  [OK]   SECURE_GetCallCount() == 10
+
+M2: HMAC-SHA256 with device key held in the Secure world
+  [OK]   RFC 4231 self-test (TC1, TC2, TC6)
+  [OK]   MAC_Compute(msg)
+         msg = "temp=21.5C;seq=1"
+         mac = 82eec65b0f953fcc7a857d5492d32e215abe3dcd9e2f0d21edc7d02215d11fb6
+  [OK]   MAC_Verify(msg, mac) accepts
+  [OK]   MAC_Verify(tampered msg) rejects
+  [OK]   MAC_Verify(tampered mac) rejects
+  [OK]   MAC_Compute(msg in Secure flash) refused
+  [OK]   MAC_Compute(mac out to Secure SRAM) refused
+  [OK]   MAC_Compute(NULL mac) refused
+
+All checks passed.
+
+M3: benchmark (cycles)
+# sysclk_hz=110000000
+# icache=1
+# runs=1000 warmup=10
+op,bytes,runs,min,median,mean,max,stddev
+timer_only,0,1000,1,1.0,1.0,2,0.0
+ns_call_empty,0,1000,7,7.0,7.0,13,0.2
+nsc_call_empty,0,1000,45,45.0,45.0,49,0.1
+hmac_ns,16,1000,26948,26948.0,26948.0,26948,0.0
+hmac_nsc,16,1000,27172,27172.0,27172.0,27178,0.2
+hmac_ns,64,1000,32144,32144.0,32144.0,32144,0.0
+hmac_nsc,64,1000,32368,32368.0,32368.0,32368,0.0
+hmac_ns,256,1000,47669,47669.0,47669.0,47669,0.0
+hmac_nsc,256,1000,47893,47893.0,47893.0,47893,0.0
+hmac_ns,1024,1000,109769,109769.0,109769.0,109769,0.0
+hmac_nsc,1024,1000,109993,109993.0,109993.0,109993,0.0
+probe_args,64,1000,48,48.0,48.0,48,0.0
+probe_checks,64,1000,142,142.0,142.0,148,0.2
+step_checks,64,1000,96,96.0,96.0,96,0.0
+step_hmac,64,1000,32150,32150.0,32150.0,32150,0.0
+step_copy,64,1000,19,19.0,19.0,19,0.0
+step_zeroize,64,1000,35,35.0,35.0,35,0.0
+step_zeroize_mbedtls,64,1000,249,249.0,249.0,249,0.0
+hmac_core_ns,64,1000,32130,32130.0,32130.4,32573,14.0
+hmac_core_s,64,1000,32139,32139.0,32139.0,32139,0.0
+probe_args,1024,1000,48,48.0,48.0,48,0.0
+probe_checks,1024,1000,142,142.0,142.0,142,0.0
+step_checks,1024,1000,96,96.0,96.0,96,0.0
+step_hmac,1024,1000,109775,109775.0,109775.0,109775,0.0
+step_copy,1024,1000,19,19.0,19.0,19,0.0
+step_zeroize,1024,1000,35,35.0,35.0,35,0.0
+step_zeroize_mbedtls,1024,1000,249,249.0,249.0,249,0.0
+hmac_core_ns,1024,1000,109755,109755.0,109755.4,110198,14.0
+hmac_core_s,1024,1000,109764,109764.0,109764.0,109764,0.0
+# M5: NS interrupt latency, cycles from timer event to handler
+# irq_period_cycles=7919 irq_period_expected=7919
+irq_idle_ns,0,1000,21,21.0,21.0,21,0.0
+irq_hmac_ns,1024,1000,21,21.0,21.0,21,0.0
+irq_hmac_s,1024,1000,30,30.0,30.3,32,0.7
+irq_nop_s,0,1000,21,30.0,25.5,30,4.5
+# end
+Benchmark done. Blinking LD1.
+

@@ -1,6 +1,6 @@
 # TrustZone-M Secure Edge Prototype
 
-**Status: M1–M4 complete**
+**Status: M1–M5 complete**
 
 How much does hardware-enforced isolation cost on a real-time embedded processor?
 This project builds a small secure communication service on an ARM Cortex-M33 with
@@ -38,7 +38,7 @@ application. The application reaches the Secure world only through Non-Secure Ca
 | `SECURE_MAC_Compute` | HMAC-SHA256 of a message with the device key |
 | `SECURE_MAC_Verify` | Constant-time check of a MAC |
 | `SECURE_CryptoSelfTest` | RFC 4231 known-answer tests (cases 1, 2, 6) |
-| `SECURE_Nop` | Empty call, used to time the bare world switch |
+| `SECURE_Nop` | Empty call, used to time the bare world switch (M3) and world-switch interrupts (M5) |
 | `SECURE_Add`, `SECURE_GetCallCount` | M1 round-trip checks |
 | `SECURE_Probe_*` | M4 measurement-only probes (would be left out of a production build) |
 
@@ -65,6 +65,7 @@ watermarks (option bytes) and GPIO pin security.
 | M2 | Secure crypto service: key isolated in Secure world | Done |
 | M3 | Measure Secure-call and crypto overhead (cycles, us) | Done |
 | M4 | Explain the Secure-service overhead step by step, fix its largest cost | Done |
+| M5 | Interrupt latency while the CPU runs Secure code | Done |
 
 **M2 verification on the board:** all functional checks pass (self-test, MAC accepted,
 tampered message and tampered MAC rejected, Secure pointers refused). The device MAC was
@@ -152,6 +153,47 @@ The step costs are identical at 1024 B: none of them depends on message size.
   used for the zeroize fix) are more reliable. The cause of the 235-cycle shift has not
   been isolated. The byte-wise `memset` loop is a plausible suspect.
 
+### M5: interrupt latency while the CPU runs Secure code
+A Non-Secure timer (TIM2) counts at the CPU clock and interrupts every 7,919 cycles, a
+prime period so interrupts land at many points of the running code. The handler reads the
+timer first, giving the cycles from the timer event to the handler. The DWT counter
+confirmed the timer runs at the CPU clock: the measured period was 7,919 cycles. 1000
+interrupts per row; two runs gave identical minimum, median and maximum values
+(`results/bench_20261031_170707.csv`, `results/bench_20261031_170748.csv`).
+
+| CPU was running | Median cycles | Max cycles | Max us | Max minus idle |
+|-----------------|--------------:|-----------:|-------:|---------------:|
+| Idle Non-Secure loop | 21 | 21 | 0.19 | 0 |
+| HMAC-SHA256 (1 KB) in Non-Secure | 21 | 21 | 0.19 | 0 |
+| HMAC-SHA256 (1 KB) inside the Secure service | 30 | 32 | 0.29 | +11 |
+| Empty Secure calls back to back | 30 | 30 | 0.27 | +9 |
+
+The 21-cycle baseline includes the handler prologue and the timer read, which are the
+same in every row. Only the differences matter.
+
+**M5 findings**
+- **Secure code delays a Non-Secure interrupt by 9–11 cycles (0.1 us), not by the length
+  of the Secure operation.** A 1 KB Secure HMAC takes about 1 ms, but an interrupt arriving
+  during it is handled after at most 32 cycles.
+- **The extra cycles come from the hardware.** When a Secure context is interrupted by a
+  Non-Secure exception, the core also saves the callee-saved registers and an integrity
+  signature on the Secure stack, then clears the registers so the Non-Secure handler
+  cannot read Secure values.
+- **Design implication:** this bound holds because the Secure service never masks
+  interrupts. A Secure critical section (interrupts disabled, or Non-Secure priorities
+  demoted with `AIRCR.PRIS`) would add its full length to Non-Secure latency. For real-time
+  use, Secure services should stay interruptible and keep any critical sections short.
+- **The Non-Secure baseline doesn't change under load.** HMAC in Non-Secure gave the same
+  21-cycle latency as the idle loop.
+
+**M5 caveats**
+- Only the entry latency is measured. The cost of returning to the interrupted Secure code
+  (unstacking and the integrity-signature check) is not yet measured.
+- The Secure service uses no floating-point registers. If Secure code used the FPU, the
+  core would also have to save and clear floating-point state, which would raise the
+  latency. Not measured.
+- TIM2 runs at the highest priority, with `AIRCR.PRIS = 0` and a warm instruction cache.
+
 **Method notes and caveats**
 - Each operation runs through the same function-pointer harness, and each wrapper makes
   exactly one further call. That way, both sides of every difference have the same call
@@ -196,21 +238,19 @@ make ISOLATION_TEST=1 flash   # optional: show a direct NS read of Secure flash 
 ```
 
 `capture.ps1` saves the transcript to `results/raw/`, the CSV to `results/`, and a
-Markdown summary with the derived overheads and the M4 step breakdown. Runs
-before M4 are named `m3_*`, later ones `bench_*`.
+Markdown summary with the derived overheads, the M4 step breakdown and the M5
+interrupt latency. Runs before M4 are named `m3_*`, later ones `bench_*`. Use
+`-FromCsv <file>` to regenerate a summary from a saved CSV without the board.
 
 ## Repository layout
 - `Secure/` Secure-world firmware: partition setup, clocks, crypto service, NSC API (`Inc/secure_nsc.h`)
-- `NonSecure/` Non-Secure application: functional checks and the M3/M4 benchmark
+- `NonSecure/` Non-Secure application: functional checks, the M3/M4 benchmark and the M5 interrupt-latency test
 - `Common/` HMAC-SHA256 and mbedTLS configuration, built into both images
 - `third_party/` Git submodules: CMSIS device and core headers, mbedTLS
 - `results/` Benchmark CSVs and summaries, raw UART logs, capture script
 - `docs/` Milestone notes and write-ups
 
 ## Next steps
-- **Interrupt latency during Secure calls:** the worst-case delay to a Non-Secure interrupt
-  while the CPU is inside the Secure service. This matters more than the average for
-  real-time autonomous systems.
 - **Hardware vs software crypto:** compare the STM32L5 HASH accelerator with software
   SHA-256, and what sharing that peripheral between the worlds costs.
 - **Remaining hygiene costs:** `hmac_sha256` itself zeroizes 160 bytes of key material
@@ -219,6 +259,8 @@ before M4 are named `m3_*`, later ones `bench_*`.
 - **Pointer checks:** see whether a specialised check for the single SAU layout used here
   can undercut the generic 96-cycle `cmse_check_address_range` path without weakening it.
 - **Code-placement sensitivity:** isolate the cause of the 639 to 404 cycle shift.
+- **Interrupt return path and FPU context:** measure the cost of resuming interrupted
+  Secure code, and the latency when Secure code has live floating-point state.
 - **Cold-cache, first-call latency.**
 
 ## Author

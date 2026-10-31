@@ -1,57 +1,70 @@
 <#
 .SYNOPSIS
-  Capture one benchmark run (M3 + M4) from the board and summarise it.
+  Capture one benchmark run (M3-M5) from the board and summarise it.
 
 .DESCRIPTION
   Listens on the ST-LINK virtual COM port until the firmware prints "# end",
   then writes (timestamped, under results/):
     raw/bench_<ts>.log   full UART transcript
     bench_<ts>.csv       benchmark rows, cycles, with the "# key=value" header
-    bench_<ts>.md        Markdown table in cycles and microseconds, plus the
-                      derived Secure-world overheads
+    bench_<ts>.md        Markdown summary: all rows in cycles and microseconds,
+                         derived Secure-world overheads, M4 step breakdown and
+                         M5 interrupt latency
 
   Start this first, then reset or flash the board (make flash).
+  With -FromCsv, skips the board and regenerates the .md next to a saved CSV.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File results/capture.ps1 -Port COM5
+.EXAMPLE
+  powershell -ExecutionPolicy Bypass -File results/capture.ps1 -FromCsv results/bench_20261031_170748.csv
 #>
 param(
   [string]$Port = 'COM5',
   [int]$Baud = 115200,
-  [int]$TimeoutSec = 120
+  [int]$TimeoutSec = 120,
+  [string]$FromCsv
 )
 
 $ErrorActionPreference = 'Stop'
 $outDir = $PSScriptRoot
-$rawDir = Join-Path $outDir 'raw'
-New-Item -ItemType Directory -Force $rawDir | Out-Null
-$ts = Get-Date -Format 'yyyyMMdd_HHmmss'
 
-$sp = New-Object System.IO.Ports.SerialPort $Port, $Baud, 'None', 8, 'One'
-$sp.Open()
-Write-Host "Listening on $Port at $Baud baud. Reset or flash the board now..."
-$sw = [Diagnostics.Stopwatch]::StartNew()
-$text = ''
-try {
-  while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec -and $text -notmatch '# end') {
-    $text += $sp.ReadExisting()
-    Start-Sleep -Milliseconds 100
+if ($FromCsv) {
+  $ts = [IO.Path]::GetFileNameWithoutExtension($FromCsv) -replace '^(bench|m3)_', ''
+  $block = Get-Content $FromCsv | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+  $mdPath = [IO.Path]::ChangeExtension((Resolve-Path $FromCsv).Path, '.md')
+} else {
+  $rawDir = Join-Path $outDir 'raw'
+  New-Item -ItemType Directory -Force $rawDir | Out-Null
+  $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
+
+  $sp = New-Object System.IO.Ports.SerialPort $Port, $Baud, 'None', 8, 'One'
+  $sp.Open()
+  Write-Host "Listening on $Port at $Baud baud. Reset or flash the board now..."
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  $text = ''
+  try {
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec -and $text -notmatch '# end') {
+      $text += $sp.ReadExisting()
+      Start-Sleep -Milliseconds 100
+    }
+  } finally {
+    $sp.Close()
   }
-} finally {
-  $sp.Close()
-}
 
-$text | Out-File -Encoding utf8 (Join-Path $rawDir "bench_$ts.log")
-if ($text -notmatch '# end') {
-  throw "Timed out after $TimeoutSec s without '# end'; transcript saved to raw/bench_$ts.log"
-}
+  $text | Out-File -Encoding utf8 (Join-Path $rawDir "bench_$ts.log")
+  if ($text -notmatch '# end') {
+    throw "Timed out after $TimeoutSec s without '# end'; transcript saved to raw/bench_$ts.log"
+  }
 
-# Keep everything from the CSV preamble ("# sysclk_hz=") through "# end".
-$lines = ($text -split "`r?`n") | ForEach-Object { $_.Trim() }
-$start = [Array]::FindIndex($lines, [Predicate[string]]{ param($l) $l -like '# sysclk_hz=*' })
-$end   = [Array]::FindIndex($lines, [Predicate[string]]{ param($l) $l -eq '# end' })
-$block = $lines[$start..$end]
-$block | Out-File -Encoding utf8 (Join-Path $outDir "bench_$ts.csv")
+  # Keep everything from the CSV preamble ("# sysclk_hz=") through "# end".
+  $lines = ($text -split "`r?`n") | ForEach-Object { $_.Trim() }
+  $start = [Array]::FindIndex($lines, [Predicate[string]]{ param($l) $l -like '# sysclk_hz=*' })
+  $end   = [Array]::FindIndex($lines, [Predicate[string]]{ param($l) $l -eq '# end' })
+  $block = $lines[$start..$end]
+  $block | Out-File -Encoding utf8 (Join-Path $outDir "bench_$ts.csv")
+  $mdPath = Join-Path $outDir "bench_$ts.md"
+}
 
 $meta = @{}
 foreach ($l in $block | Where-Object { $_ -like '# *=*' }) {
@@ -119,6 +132,24 @@ foreach ($b in ($rows | Where-Object { $_.op -eq 'step_checks' } | ForEach-Objec
   $md += "| _For comparison: mbedtls_platform_zeroize, same buffer_ | $(Med 'step_zeroize_mbedtls' $b) | $(Us (Med 'step_zeroize_mbedtls' $b)) | |"
 }
 
-$md | Out-File -Encoding utf8 (Join-Path $outDir "bench_$ts.md")
+# M5: interrupt latency (needs the irq_* rows).
+$irqRows = $rows | Where-Object { $_.op -like 'irq_*' }
+if ($irqRows) {
+  $base = Row 'irq_idle_ns' 0
+  $md += ''
+  $md += "M5: Non-Secure interrupt latency, cycles from timer event to handler (TIM2 period check: $($meta['irq_period_cycles']) observed, $($meta['irq_period_expected']) expected):"
+  $md += ''
+  $md += '| Foreground code | Median | Max | Max us | Max minus idle max |'
+  $md += '|-----------------|-------:|----:|-------:|-------------------:|'
+  foreach ($r in $irqRows) {
+    $md += "| $($r.op) ($($r.bytes) B) | $($r.median) | $($r.max) | $(Us $r.max) | $([double]$r.max - [double]$base.max) |"
+  }
+}
+
+$md | Out-File -Encoding utf8 $mdPath
 $md -join "`n"
-Write-Host "`nSaved results/bench_$ts.csv, results/bench_$ts.md, results/raw/bench_$ts.log"
+if ($FromCsv) {
+  Write-Host "`nSaved $mdPath"
+} else {
+  Write-Host "`nSaved results/bench_$ts.csv, results/bench_$ts.md, results/raw/bench_$ts.log"
+}
