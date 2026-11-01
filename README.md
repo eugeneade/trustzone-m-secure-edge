@@ -7,6 +7,9 @@ This project builds a small secure communication service on an ARM Cortex-M33 wi
 TrustZone-M and measures the latency of moving security functions (key storage, message
 authentication) into the hardware-isolated Secure world.
 
+A 4-page technical report with the method, results and open questions is in
+[docs/technical_report.md](docs/technical_report.md).
+
 It is a first step toward my research interest: hardware-software co-design for secure,
 trustworthy communication in autonomous edge systems, specifically, which security
 responsibilities belong in hardware, which in software, and what each choice costs in
