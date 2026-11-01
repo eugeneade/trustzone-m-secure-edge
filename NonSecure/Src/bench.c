@@ -29,7 +29,7 @@
 typedef void (*bench_op_t)(uint32_t len);
 
 static uint32_t samples[BENCH_RUNS];
-static uint8_t msg[MSG_MAX];
+static uint8_t msg[MSG_MAX] __attribute__((aligned(4)));   /* aligned: HASH DMA path */
 static uint8_t mac[HMAC_SHA256_SIZE];
 
 /* NS-side key for the baseline only; it plays no part in the Secure service. */
@@ -67,6 +67,12 @@ __attribute__((noinline, noipa)) static void op_hmac_nsc(uint32_t len)
   (void)SECURE_MAC_Compute(msg, len, mac);
 }
 
+/* M6: same service on the HASH peripheral. */
+__attribute__((noinline, noipa)) static void op_hmac_hw_nsc(uint32_t len)
+{
+  (void)SECURE_MAC_ComputeHw(msg, len, mac);
+}
+
 /* M4: Secure probes, each one more step of SECURE_MAC_Compute. */
 __attribute__((noinline, noipa)) static void op_probe_args(uint32_t len)
 {
@@ -101,6 +107,51 @@ static void measure(bench_op_t op, uint32_t len)
 
 /* hmac_sha256() alone, timed around the call inside each world, so call and
  * world-switch costs are excluded. Compares the same code in S and NS. */
+/* Instruction-cache misses per call (ICACHE miss monitor), to test whether
+ * code-placement sensitivity comes from cache conflicts between the code
+ * paths of the two worlds. Same harness and warm-up as measure(). */
+static void measure_icache_misses(bench_op_t op, uint32_t len)
+{
+  for (uint32_t i = 0U; i < BENCH_WARMUP; i++)
+  {
+    op(len);
+  }
+
+  ICACHE->CR |= ICACHE_CR_MISSMEN;
+  __disable_irq();
+  for (uint32_t i = 0U; i < BENCH_RUNS; i++)
+  {
+    ICACHE->CR |= ICACHE_CR_MISSMRST;
+    ICACHE->CR &= ~ICACHE_CR_MISSMRST;
+    op(len);
+    samples[i] = ICACHE->MMONR & ICACHE_MMONR_MISSMON_Msk;
+  }
+  __enable_irq();
+  ICACHE->CR &= ~ICACHE_CR_MISSMEN;
+}
+
+__attribute__((noinline, noipa)) static void op_mac_steps(uint32_t len)
+{
+  uint32_t steps[SECURE_PROBE_STEPS];
+  (void)SECURE_Probe_MacSteps(msg, len, mac, steps);
+}
+
+/* M6: hardware HMAC alone, timed inside the Secure world. */
+static void measure_hw_core(uint32_t len)
+{
+  for (uint32_t i = 0U; i < BENCH_WARMUP; i++)
+  {
+    (void)SECURE_Probe_HwHmacCycles(msg, len, mac);
+  }
+
+  __disable_irq();
+  for (uint32_t i = 0U; i < BENCH_RUNS; i++)
+  {
+    samples[i] = SECURE_Probe_HwHmacCycles(msg, len, mac);
+  }
+  __enable_irq();
+}
+
 static void measure_hmac_core(int secure, uint32_t len)
 {
   for (uint32_t i = 0U; i < BENCH_WARMUP; i++)
@@ -253,6 +304,8 @@ void bench_run(void)
   if (hmac_sha256(ns_key, sizeof(ns_key), msg, MSG_MAX, mac) != 0 ||
       SECURE_MAC_Compute(msg, MSG_MAX, mac) != SECURE_OK ||
       SECURE_Probe_HmacCycles(msg, MSG_MAX, mac) == 0U ||
+      SECURE_MAC_ComputeHw(msg, MSG_MAX, mac) != SECURE_OK ||
+      SECURE_Probe_HwHmacCycles(msg, MSG_MAX, mac) == 0U ||
       SECURE_Probe_MacSteps(msg, MSG_MAX, mac, (uint32_t[SECURE_PROBE_STEPS]){0}) != SECURE_OK)
   {
     uart_puts("\nM3: benchmark aborted, HMAC operation failed\n");
@@ -286,6 +339,12 @@ void bench_run(void)
 
     measure(op_hmac_nsc, sizes[s]);
     report("hmac_nsc", sizes[s]);
+
+    measure(op_hmac_hw_nsc, sizes[s]);
+    report("hmac_hw_nsc", sizes[s]);
+
+    measure_hw_core(sizes[s]);
+    report("hmac_core_hw_s", sizes[s]);
   }
 
   /* M4: break the fixed Secure-service overhead into its steps. Two sizes
@@ -309,5 +368,18 @@ void bench_run(void)
 
     measure_hmac_core(1, len);
     report("hmac_core_s", len);
+
+    /* Same rows, counting instruction-cache misses per call instead of cycles. */
+    measure_icache_misses(op_hmac_ns, len);
+    report("icmiss_hmac_ns", len);
+
+    measure_icache_misses(op_hmac_nsc, len);
+    report("icmiss_hmac_nsc", len);
+
+    measure_icache_misses(op_mac_steps, len);
+    report("icmiss_mac_steps", len);
+
+    measure_icache_misses(op_hmac_hw_nsc, len);
+    report("icmiss_hmac_hw_nsc", len);
   }
 }

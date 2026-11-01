@@ -15,6 +15,7 @@
 #include <stddef.h>
 #include <string.h>
 #include "stm32l5xx.h"
+#include "hash_hw.h"
 #include "hmac_sha256.h"
 #include "mbedtls/platform_util.h"
 #include "secure_nsc.h"
@@ -74,11 +75,36 @@ static int ns_buffer_ok(const void *p, uint32_t len, int mpu_flags)
   return cmse_check_address_range((void *)p, len, CMSE_NONSECURE | mpu_flags) != NULL;
 }
 
-/* ---------------------------- NSC entry points ---------------------------- */
+/*
+ * The HASH peripheral holds one computation at a time. A Non-Secure interrupt
+ * handler can call into the Secure world while an earlier call is suspended
+ * mid-computation; that nested call must not touch the peripheral. On this
+ * single core a nested call runs to completion before the outer one resumes,
+ * so a plain flag is enough: the outer and nested calls never both proceed.
+ */
+static volatile uint32_t hash_hw_busy;
 
-CMSE_NS_ENTRY secure_status_t SECURE_CryptoSelfTest(void)
+static int hash_hw_acquire(void)
 {
-  /* RFC 4231 test cases 1, 2 and 6 (6 exercises the hashed long-key path). */
+  if (hash_hw_busy != 0U)
+  {
+    return 0;
+  }
+  hash_hw_busy = 1U;
+  return 1;
+}
+
+static void hash_hw_release(void)
+{
+  hash_hw_busy = 0U;
+}
+
+typedef int (*hmac_fn_t)(const uint8_t *key, size_t key_len,
+                         const uint8_t *msg, size_t msg_len, uint8_t out[SECURE_MAC_SIZE]);
+
+/* RFC 4231 test cases 1, 2 and 6 (6 exercises the hashed long-key path). */
+static secure_status_t hmac_kat(hmac_fn_t hmac)
+{
   static const uint8_t tc1_data[] = "Hi There";
   static const uint8_t tc1_mac[SECURE_MAC_SIZE] = {
     0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53, 0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b, 0xf1, 0x2b,
@@ -101,18 +127,36 @@ CMSE_NS_ENTRY secure_status_t SECURE_CryptoSelfTest(void)
   uint32_t fail = 0U;
 
   memset(key, 0x0b, 20);
-  fail |= (uint32_t)hmac_sha256(key, 20, tc1_data, sizeof(tc1_data) - 1U, mac);
+  fail |= (uint32_t)hmac(key, 20, tc1_data, sizeof(tc1_data) - 1U, mac);
   fail |= ct_compare(mac, tc1_mac, sizeof(mac));
 
-  fail |= (uint32_t)hmac_sha256(tc2_key, sizeof(tc2_key) - 1U, tc2_data, sizeof(tc2_data) - 1U, mac);
+  fail |= (uint32_t)hmac(tc2_key, sizeof(tc2_key) - 1U, tc2_data, sizeof(tc2_data) - 1U, mac);
   fail |= ct_compare(mac, tc2_mac, sizeof(mac));
 
   memset(key, 0xaa, sizeof(key));
-  fail |= (uint32_t)hmac_sha256(key, sizeof(key), tc6_data, sizeof(tc6_data) - 1U, mac);
+  fail |= (uint32_t)hmac(key, sizeof(key), tc6_data, sizeof(tc6_data) - 1U, mac);
   fail |= ct_compare(mac, tc6_mac, sizeof(mac));
 
   zeroize_words(mac, sizeof(mac));
   return (fail == 0U) ? SECURE_OK : SECURE_ERR_SELFTEST;
+}
+
+/* ---------------------------- NSC entry points ---------------------------- */
+
+CMSE_NS_ENTRY secure_status_t SECURE_CryptoSelfTest(void)
+{
+  return hmac_kat(hmac_sha256);
+}
+
+CMSE_NS_ENTRY secure_status_t SECURE_CryptoSelfTestHw(void)
+{
+  if (!hash_hw_acquire())
+  {
+    return SECURE_ERR_BUSY;
+  }
+  secure_status_t status = hmac_kat(hash_hw_hmac_sha256);
+  hash_hw_release();
+  return status;
 }
 
 CMSE_NS_ENTRY secure_status_t SECURE_MAC_Compute(const uint8_t *msg, uint32_t len,
@@ -159,6 +203,35 @@ CMSE_NS_ENTRY secure_status_t SECURE_MAC_Verify(const uint8_t *msg, uint32_t len
   }
   zeroize_words(tag, sizeof(tag));
   return status;
+}
+
+/* M6: same contract as SECURE_MAC_Compute, computed by the HASH peripheral. */
+CMSE_NS_ENTRY secure_status_t SECURE_MAC_ComputeHw(const uint8_t *msg, uint32_t len,
+                                                   uint8_t mac[SECURE_MAC_SIZE])
+{
+  uint8_t tag[SECURE_MAC_SIZE] __attribute__((aligned(4)));
+
+  if (!ns_buffer_ok(msg, len, CMSE_MPU_READ) ||
+      mac == NULL || !ns_buffer_ok(mac, SECURE_MAC_SIZE, CMSE_MPU_READWRITE))
+  {
+    return SECURE_ERR_PARAM;
+  }
+  if (!hash_hw_acquire())
+  {
+    return SECURE_ERR_BUSY;
+  }
+
+  int ret = hash_hw_hmac_sha256(device_key, sizeof(device_key), msg, len, tag);
+  hash_hw_release();
+
+  if (ret != 0)
+  {
+    zeroize_words(tag, sizeof(tag));
+    return SECURE_ERR_INTERNAL;
+  }
+  memcpy(mac, tag, sizeof(tag));
+  zeroize_words(tag, sizeof(tag));
+  return SECURE_OK;
 }
 
 /* ------------------------- M4 measurement probes -------------------------- */
@@ -251,4 +324,40 @@ CMSE_NS_ENTRY secure_status_t SECURE_Probe_MacSteps(const uint8_t *msg, uint32_t
   steps[3] = t4 - t3;
   steps[4] = t5 - t4;
   return (ret == 0) ? SECURE_OK : SECURE_ERR_INTERNAL;
+}
+
+/* M6: cycles of hash_hw_hmac_sha256() alone, timed inside the Secure world
+ * (0 on error or if the peripheral is busy). */
+CMSE_NS_ENTRY uint32_t SECURE_Probe_HwHmacCycles(const uint8_t *msg, uint32_t len,
+                                                 uint8_t mac[SECURE_MAC_SIZE])
+{
+  uint8_t tag[SECURE_MAC_SIZE] __attribute__((aligned(4)));
+
+  if (!ns_buffer_ok(msg, len, CMSE_MPU_READ) ||
+      mac == NULL || !ns_buffer_ok(mac, SECURE_MAC_SIZE, CMSE_MPU_READWRITE) ||
+      !hash_hw_acquire())
+  {
+    return 0U;
+  }
+
+  uint32_t t0 = DWT->CYCCNT;
+  int ret = hash_hw_hmac_sha256(device_key, sizeof(device_key), msg, len, tag);
+  uint32_t t1 = DWT->CYCCNT;
+
+  hash_hw_release();
+  zeroize_words(tag, sizeof(tag));
+  return (ret == 0) ? (t1 - t0) : 0U;
+}
+
+/* M6 latency diagnosis: let the NS app watch which driver phase an interrupt
+ * lands in. The marker must be a Non-Secure, writable word (or NULL). */
+CMSE_NS_ENTRY secure_status_t SECURE_Probe_SetHashPhaseMarker(volatile uint32_t *marker)
+{
+  if (marker != NULL &&
+      !ns_buffer_ok((const void *)marker, sizeof(*marker), CMSE_MPU_READWRITE))
+  {
+    return SECURE_ERR_PARAM;
+  }
+  hash_hw_set_phase_marker(marker);
+  return SECURE_OK;
 }

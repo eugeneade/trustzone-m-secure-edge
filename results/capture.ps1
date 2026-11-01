@@ -39,18 +39,29 @@ if ($FromCsv) {
   $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
 
   $sp = New-Object System.IO.Ports.SerialPort $Port, $Baud, 'None', 8, 'One'
+  # Drain the ST-LINK bridge quickly: a large driver buffer and short polls.
+  # With 100 ms polls and the default 4 KB buffer, whole sections were lost.
+  $sp.ReadBufferSize = 1MB
   $sp.Open()
   Write-Host "Listening on $Port at $Baud baud. Reset or flash the board now..."
   $sw = [Diagnostics.Stopwatch]::StartNew()
-  $text = ''
+  $sb = New-Object System.Text.StringBuilder
+  $done = $false
   try {
-    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec -and $text -notmatch '# end') {
-      $text += $sp.ReadExisting()
-      Start-Sleep -Milliseconds 100
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec -and -not $done) {
+      $chunk = $sp.ReadExisting()
+      if ($chunk.Length -gt 0) {
+        [void]$sb.Append($chunk)
+        # Only the tail can newly contain the end marker.
+        $tailLen = [Math]::Min($sb.Length, $chunk.Length + 8)
+        $done = $sb.ToString($sb.Length - $tailLen, $tailLen) -match '# end'
+      }
+      Start-Sleep -Milliseconds 20
     }
   } finally {
     $sp.Close()
   }
+  $text = $sb.ToString()
 
   $text | Out-File -Encoding utf8 (Join-Path $rawDir "bench_$ts.log")
   if ($text -notmatch '# end') {
@@ -143,6 +154,29 @@ if ($irqRows) {
   $md += '|-----------------|-------:|----:|-------:|-------------------:|'
   foreach ($r in $irqRows) {
     $md += "| $($r.op) ($($r.bytes) B) | $($r.median) | $($r.max) | $(Us $r.max) | $([double]$r.max - [double]$base.max) |"
+  }
+}
+
+# M6: hardware HASH vs software (needs the hmac_hw_nsc / hmac_core_hw_s rows).
+$hwSizes = $rows | Where-Object { $_.op -eq 'hmac_hw_nsc' } | ForEach-Object { $_.bytes }
+if ($hwSizes) {
+  $md += ''
+  $md += 'M6: HMAC-SHA256, software vs HASH peripheral (median cycles):'
+  $md += ''
+  $md += '| Bytes | SW in NS | SW Secure service | HW Secure service | HW core (in Secure) | HW service minus HW core | Speedup, SW service / HW service |'
+  $md += '|------:|---------:|------------------:|------------------:|--------------------:|-------------------------:|---------------------------------:|'
+  foreach ($b in $hwSizes) {
+    $swNs = Med 'hmac_ns' $b
+    $swS = Med 'hmac_nsc' $b
+    $hwS = Med 'hmac_hw_nsc' $b
+    $hwCore = Med 'hmac_core_hw_s' $b
+    $md += "| $b | $swNs | $swS | $hwS | $hwCore | $($hwS - $hwCore) | {0:N1}x |" -f ($swS / $hwS)
+  }
+  if ($meta.ContainsKey('hw_contention_irqs')) {
+    $md += ''
+    $md += "HASH peripheral contention: $($meta['hw_contention_irqs']) interrupts each requested a 16-byte hardware MAC while the foreground ran 1 KB hardware MACs. " +
+           "Busy (refused): $($meta['hw_contention_busy']), computed correctly: $($meta['hw_contention_ok']), wrong or failed: $($meta['hw_contention_handler_errors']). " +
+           "Foreground: $($meta['hw_contention_fg_runs']) MACs, $($meta['hw_contention_fg_errors']) wrong or failed."
   }
 }
 

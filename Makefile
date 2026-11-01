@@ -38,6 +38,7 @@ CRYPTO_SRCS := Common/Src/hmac_sha256.c \
 # ---- Secure image ----------------------------------------------------------
 S_SRCS := Secure/Src/main.c \
           Secure/Src/crypto_service.c \
+          Secure/Src/hash_hw.c \
           $(CRYPTO_SRCS) \
           $(DEV)/Source/Templates/system_stm32l5xx_s.c \
           $(DEV)/Source/Templates/gcc/startup_stm32l552xx.s

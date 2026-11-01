@@ -1,0 +1,19 @@
+﻿icmiss_hmac_nsc,1024,1000,0,0.0,0.0,0,0.0
+icmiss_mac_steps,1024,1000,0,0.0,0.0,0,0.0
+icmiss_hmac_hw_nsc,1024,1000,0,0.0,0.0,0,0.0
+# M5: NS interrupt latency, cycles from timer event to handler
+# irq_period_cycles=7919 irq_period_expected=7919
+irq_idle_ns,0,1000,24,24.0,24.0,24,0.0
+irq_hmac_ns,1024,1000,24,24.0,24.0,24,0.0
+irq_hmac_s,1024,1000,33,33.0,33.0,33,0.0
+irq_nop_s,0,1000,24,33.0,32.1,33,2.7
+irq_hmac_hw_s,1024,1000,33,34.0,35.2,55,4.2
+irqph_none,0,100,24,33.0,32.9,33,0.9
+irqph_key1_wait,4,98,34,34.0,34.0,34,0.0
+irqph_msg,5,702,34,35.0,42.7,76,14.0
+irqph_msg_wait,7,98,34,34.0,34.0,35,0.1
+irqph_key2,8,2,34,34.5,34.5,35,0.7
+# hw_contention_irqs=1000 hw_contention_busy=859 hw_contention_ok=141 hw_contention_handler_errors=0 hw_contention_fg_runs=1667 hw_contention_fg_errors=0
+# end
+Benchmark done. Blinking LD1.
+

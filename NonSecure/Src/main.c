@@ -7,6 +7,7 @@
  * the ST-LINK virtual COM port (see uart.h).
  */
 #include <stddef.h>
+#include <string.h>
 #include "stm32l5xx.h"
 #include "secure_nsc.h"
 #include "bench.h"
@@ -14,6 +15,42 @@
 #include "uart.h"
 
 static uint32_t failures;
+
+/* Lengths around the 4-byte word and 64-byte block boundaries, where the
+ * hardware's NBLW handling and padding could go wrong. */
+static const uint32_t hw_test_lens[] = {0U, 1U, 3U, 4U, 5U, 55U, 56U, 63U, 64U, 65U, 127U, 128U, 1000U, 1024U};
+static uint8_t hw_test_buf[1024U + 1U] __attribute__((aligned(4)));   /* offset 0: DMA path, 1: CPU path */
+
+/* Hardware and software HMAC (same Secure device key) must agree, including
+ * for a message that starts at an odd address. */
+static int hw_matches_sw(void)
+{
+  uint8_t mac_sw[SECURE_MAC_SIZE];
+  uint8_t mac_hw[SECURE_MAC_SIZE];
+
+  for (uint32_t i = 0U; i < sizeof(hw_test_buf); i++)
+  {
+    hw_test_buf[i] = (uint8_t)(i * 7U + 3U);
+  }
+
+  for (uint32_t offset = 0U; offset <= 1U; offset++)
+  {
+    for (uint32_t i = 0U; i < sizeof(hw_test_lens) / sizeof(hw_test_lens[0]); i++)
+    {
+      const uint8_t *m = &hw_test_buf[offset];
+      if (SECURE_MAC_Compute(m, hw_test_lens[i], mac_sw) != SECURE_OK ||
+          SECURE_MAC_ComputeHw(m, hw_test_lens[i], mac_hw) != SECURE_OK ||
+          memcmp(mac_sw, mac_hw, sizeof(mac_sw)) != 0)
+      {
+        uart_puts("         mismatch at len ");
+        uart_putu(hw_test_lens[i]);
+        uart_puts(offset != 0U ? " (unaligned)\n" : "\n");
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
 
 static void check(const char *what, int ok)
 {
@@ -93,6 +130,13 @@ int main(void)
         SECURE_MAC_Compute(msg, msg_len, (uint8_t *)0x30000000UL) == SECURE_ERR_PARAM);
   check("MAC_Compute(NULL mac) refused",
         SECURE_MAC_Compute(msg, msg_len, NULL) == SECURE_ERR_PARAM);
+
+  /* ---- M6: hardware HASH peripheral ---- */
+  uart_puts("\nM6: HMAC-SHA256 on the HASH peripheral (Secure-only)\n");
+  check("RFC 4231 self-test on hardware (TC1, TC2, TC6)", SECURE_CryptoSelfTestHw() == SECURE_OK);
+  check("hardware MAC == software MAC at all test lengths", hw_matches_sw());
+  check("MAC_ComputeHw(msg in Secure flash) refused",
+        SECURE_MAC_ComputeHw((const uint8_t *)0x0C000000UL, 64U, mac) == SECURE_ERR_PARAM);
 
   uart_puts(failures == 0U ? "\nAll checks passed.\n" : "\nSome checks FAILED.\n");
 

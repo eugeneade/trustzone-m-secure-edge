@@ -1,6 +1,6 @@
 # TrustZone-M Secure Edge Prototype
 
-**Status: M1–M5 complete**
+**Status: M1–M6 complete**
 
 How much does hardware-enforced isolation cost on a real-time embedded processor?
 This project builds a small secure communication service on an ARM Cortex-M33 with
@@ -37,7 +37,9 @@ application. The application reaches the Secure world only through Non-Secure Ca
 |-------------|---------|
 | `SECURE_MAC_Compute` | HMAC-SHA256 of a message with the device key |
 | `SECURE_MAC_Verify` | Constant-time check of a MAC |
+| `SECURE_MAC_ComputeHw` | Same as `SECURE_MAC_Compute`, on the HASH peripheral (M6) |
 | `SECURE_CryptoSelfTest` | RFC 4231 known-answer tests (cases 1, 2, 6) |
+| `SECURE_CryptoSelfTestHw` | The same tests on the HASH peripheral |
 | `SECURE_Nop` | Empty call, used to time the bare world switch (M3) and world-switch interrupts (M5) |
 | `SECURE_Add`, `SECURE_GetCallCount` | M1 round-trip checks |
 | `SECURE_Probe_*` | M4 measurement-only probes (would be left out of a production build) |
@@ -56,7 +58,9 @@ Secure service read or overwrite Secure memory on its behalf (a "confused deputy
 | SRAM1 upper 96 KB + SRAM2 | `0x20018000`–`0x2003FFFF` | Non-Secure |
 
 Enforced by the SAU (CPU side), GTZC block-based SRAM protection, flash secure
-watermarks (option bytes) and GPIO pin security.
+watermarks (option bytes) and GPIO pin security. The HASH peripheral is made Secure-only in
+GTZC (M6), because it holds the device key while computing.
+
 
 ## Milestones
 | # | Milestone | Status |
@@ -66,6 +70,7 @@ watermarks (option bytes) and GPIO pin security.
 | M3 | Measure Secure-call and crypto overhead (cycles, us) | Done |
 | M4 | Explain the Secure-service overhead step by step, fix its largest cost | Done |
 | M5 | Interrupt latency while the CPU runs Secure code | Done |
+| M6 | Hardware HASH accelerator vs software HMAC, and sharing it safely | Done |
 
 **M2 verification on the board:** all functional checks pass (self-test, MAC accepted,
 tampered message and tampered MAC rejected, Secure pointers refused). The device MAC was
@@ -150,8 +155,8 @@ The step costs are identical at 1024 B: none of them depends on message size.
   `SECURE_MAC_Compute` did not change, yet its measured overhead moved from 639 to 404
   cycles because other code moved in flash. Step timings also shift by a few cycles
   between builds. Cross-build comparisons need that caveat; within-build comparisons (as
-  used for the zeroize fix) are more reliable. The cause of the 235-cycle shift has not
-  been isolated. The byte-wise `memset` loop is a plausible suspect.
+  used for the zeroize fix) are more reliable. M6 traced this to instruction-cache
+  conflicts (below).
 
 ### M5: interrupt latency while the CPU runs Secure code
 A Non-Secure timer (TIM2) counts at the CPU clock and interrupts every 7,919 cycles, a
@@ -193,6 +198,95 @@ same in every row. Only the differences matter.
   core would also have to save and clear floating-point state, which would raise the
   latency. Not measured.
 - TIM2 runs at the highest priority, with `AIRCR.PRIS = 0` and a warm instruction cache.
+- Worst-case values vary between builds. In later builds the Secure-HMAC maximum ranged
+  from 33 to 52 cycles, with the median fixed at +9.
+
+### M6: hardware HASH accelerator vs software
+The STM32L552 HASH peripheral computes HMAC-SHA256 in hardware. `SECURE_MAC_ComputeHw` uses
+it with the same device key and the same checks as the software service. The peripheral
+is made Secure-only in GTZC, so the Non-Secure world cannot reach the key while it is in
+the peripheral. The hardware MAC passes the RFC 4231 vectors and matches the software
+MAC at 14 lengths around the 4-byte and 64-byte boundaries, from aligned and misaligned
+buffers. The message is fed to the peripheral by DMA (see the latency fix below). Two
+runs of the final build gave identical minimum, median and maximum values, and identical
+contention counts (`results/bench_20261031_201517.csv`,
+`results/bench_20261031_201556.csv`).
+
+| Bytes | SW in Non-Secure | SW Secure service | HW Secure service | HW alone (inside Secure) | Service overhead around HW | Speedup |
+|------:|-----------------:|------------------:|------------------:|-------------------------:|---------------------------:|--------:|
+| 16 | 26,948 | 27,150 | 943 | 738 | 205 | 28.8× |
+| 64 | 32,144 | 32,346 | 1,111 | 906 | 205 | 29.1× |
+| 256 | 47,669 | 47,871 | 1,687 | 1,482 | 205 | 28.4× |
+| 1024 | 109,769 | 109,971 | 3,991 | 3,786 | 205 | 27.6× |
+
+Median cycles; speedup is the software Secure service divided by the hardware Secure service.
+
+**M6 findings**
+- **Hardware is 28–29× faster.** A 1 KB HMAC takes 36 us instead of 1 ms: about 3.0 cycles
+  per byte against 81 in software.
+- **Acceleration makes the isolation boundary matter again.** The Secure service adds a
+  fixed 205 cycles around the hardware computation (world switch, pointer checks, tag
+  copy and zeroize). That is 22% of a 16-byte MAC and 5% of a 1 KB MAC, against under 1%
+  with software crypto. With hardware crypto, the cost of crossing into the Secure world
+  becomes a first-order design concern for small messages.
+- **Sharing one accelerator needs serialisation.** In the contention test, each of 1,000
+  Non-Secure interrupts requested a 16-byte hardware MAC while the main loop ran 1 KB
+  hardware MACs. The busy flag refused 848 nested requests and 152 completed correctly.
+  All 1,750 main-loop MACs were correct. An interrupt handler can't count on the
+  accelerator being free, so a real design needs a fallback (software, or retry later).
+
+**Hardware worst-case interrupt latency: diagnosed and fixed**
+
+The first version fed the message to the peripheral with CPU writes. While the Secure
+world drove the HASH peripheral, Non-Secure interrupt latency had a median of 35 cycles
+but a maximum of 64–76, against 33 with software HMAC.
+
+1. **Ruled out stalls on a full FIFO.** Waiting in an interruptible loop for the core to go
+   idle before each 64-byte block did not lower the maximum (71 with it, 69 without,
+   `results/bench_20261031_191738.csv`). With CPU feeding the accelerator is also
+   feed-bound: one extra check per word slowed the hardware path by 26% at 1 KB.
+2. **Located the stall.** The driver was instrumented to write its current phase to a
+   Non-Secure marker word, and the interrupt handler recorded it with each sample
+   (`SECURE_Probe_SetHashPhaseMarker`). Every elevated sample fell while the CPU was
+   writing message words to `DIN` (702 samples, max 76). The waits, the key phases and the
+   digest read all stayed at 33–35 (`results/raw/bench_20261031_201026.log`). A `DIN` write
+   that hands a full block to the hash core stalls the CPU on the bus during the hand-over.
+   The core cannot take an interrupt until that write completes. That is why waiting for
+   the core to go idle did not help.
+3. **Fixed by feeding the message with DMA.** DMA1 channel 1 now feeds aligned messages
+   from Non-Secure memory. The DMA engine absorbs the stalls while the CPU polls the DMA
+   status in an interruptible loop, never the HASH registers, which a stalled DMA write
+   would hold up. The channel is Secure, but its source is marked Non-Secure (`SSEC = 0`),
+   so the DMA hardware can only read Non-Secure memory, whatever address it is given.
+   Secure buffers (the self-test vectors) and unaligned messages still use CPU writes.
+
+| Non-Secure interrupt latency during hardware HMAC (1 KB) | Median | Max | Max minus idle |
+|-----------------------------------------------------------|-------:|----:|---------------:|
+| CPU feeds the message (before) | 34–35 | 64–76 | +40 to +52 |
+| **DMA feeds the message (after)** | **37** | **38** | **+14** |
+
+The worst case is now 1 cycle above the median: hardware HMAC no longer adds unbounded
+jitter. Throughput is unchanged at 1 KB (3,991 vs 4,063 cycles); 16-byte messages pay about
+50 cycles for the DMA setup.
+
+One detail found on the board: the DMAMUX request routing (`DMAMUX1_Channel0`, request 92
+= HASH_IN) must be written after the DMA channel is made Secure. A Secure write made
+before that was silently ignored. A debugger snapshot showed the routing register reading
+back 0 and the DMA channel enabled with no words transferred.
+
+**Instruction-cache conflicts explain the M4 residual.** The ICACHE miss counter was read
+around single calls. The Secure software service takes 40 misses per call; the step probe,
+which runs the same steps from different addresses, takes 0. The Non-Secure HMAC takes 15,
+and the hardware service takes 0. In the three builds measured, the residual tracked the
+service's extra misses at about 8–10 cycles per miss. Example: 30 misses and a 256-cycle
+residual in `results/bench_20261031_191738.csv`. When code moves, hot Secure and
+Non-Secure code can land in the same cache sets and evict each other. This explains why
+`SECURE_MAC_Compute` overhead moved between 226 and 640 cycles across builds with no source
+change. Without cache misses, the HMAC core takes the same 32,130 cycles in either world.
+
+**M6 caveat:** after a computation the HASH peripheral still holds key-derived state in
+its digest and context registers. Only GTZC keeps the Non-Secure world from reading it,
+because the driver does not clear that state.
 
 **Method notes and caveats**
 - Each operation runs through the same function-pointer harness, and each wrapper makes
@@ -251,14 +345,18 @@ interrupt latency. Runs before M4 are named `m3_*`, later ones `bench_*`. Use
 - `docs/` Milestone notes and write-ups
 
 ## Next steps
-- **Hardware vs software crypto:** compare the STM32L5 HASH accelerator with software
-  SHA-256, and what sharing that peripheral between the worlds costs.
+- **Hardware path for small messages:** DMA setup costs about 50 cycles at 16 B; measure
+  where CPU feeding of short messages beats DMA without hurting worst-case latency.
+- **Cache-aware placement:** keep hot Secure code from conflicting with Non-Secure code
+  (linker placement, or the ICACHE region configuration), and measure how much of the
+  cross-build variation that removes.
+- **Accelerator fallback policy:** when the HASH peripheral is busy, compare retrying
+  later with falling back to software HMAC, for interrupt-context callers.
 - **Remaining hygiene costs:** `hmac_sha256` itself zeroizes 160 bytes of key material
   with the same byte-wise `memset` in both worlds. Also compare newlib-nano with full
   newlib, whose `memset`/`memcpy` work a word at a time.
 - **Pointer checks:** see whether a specialised check for the single SAU layout used here
   can undercut the generic 96-cycle `cmse_check_address_range` path without weakening it.
-- **Code-placement sensitivity:** isolate the cause of the 639 to 404 cycle shift.
 - **Interrupt return path and FPU context:** measure the cost of resuming interrupted
   Secure code, and the latency when Secure code has live floating-point state.
 - **Cold-cache, first-call latency.**

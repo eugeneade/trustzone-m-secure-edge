@@ -18,7 +18,8 @@ typedef enum
   SECURE_ERR_PARAM     = 1,   /* NULL pointer or buffer not fully Non-Secure */
   SECURE_ERR_MAC       = 2,   /* MAC verification failed */
   SECURE_ERR_SELFTEST  = 3,   /* known-answer test failed */
-  SECURE_ERR_INTERNAL  = 4
+  SECURE_ERR_INTERNAL  = 4,
+  SECURE_ERR_BUSY      = 5    /* HASH peripheral in use by an interrupted call */
 } secure_status_t;
 
 /* Provided by system_stm32l5xx_s.c (ST template). */
@@ -46,6 +47,13 @@ secure_status_t SECURE_MAC_Compute(const uint8_t *msg, uint32_t len,
 secure_status_t SECURE_MAC_Verify(const uint8_t *msg, uint32_t len,
                                   const uint8_t mac[SECURE_MAC_SIZE]);
 
+/* M6: hardware HMAC on the HASH peripheral (made Secure-only at boot).
+ * Same contracts as the software versions; SECURE_ERR_BUSY if a call that is
+ * suspended by an interrupt still holds the peripheral. */
+secure_status_t SECURE_CryptoSelfTestHw(void);
+secure_status_t SECURE_MAC_ComputeHw(const uint8_t *msg, uint32_t len,
+                                     uint8_t mac[SECURE_MAC_SIZE]);
+
 /* M4: measurement-only probes. Each adds one step of SECURE_MAC_Compute:
  * argument passing, pointer checks. */
 secure_status_t SECURE_Probe_Args(const uint8_t *msg, uint32_t len,
@@ -64,5 +72,32 @@ uint32_t SECURE_Probe_HmacCycles(const uint8_t *msg, uint32_t len,
 secure_status_t SECURE_Probe_MacSteps(const uint8_t *msg, uint32_t len,
                                       uint8_t mac[SECURE_MAC_SIZE],
                                       uint32_t steps[SECURE_PROBE_STEPS]);
+
+/* M6: cycles of the hardware HMAC alone, timed inside the Secure world. */
+uint32_t SECURE_Probe_HwHmacCycles(const uint8_t *msg, uint32_t len,
+                                   uint8_t mac[SECURE_MAC_SIZE]);
+
+/* M6 latency diagnosis: phases of the hardware HMAC driver. With a marker
+ * registered, the driver writes the current phase to it, so a Non-Secure
+ * interrupt handler can tell where in the driver it interrupted. */
+typedef enum
+{
+  HASH_PHASE_NONE = 0,        /* outside the driver */
+  HASH_PHASE_INIT,            /* CR writes, INIT */
+  HASH_PHASE_KEY1,            /* inner key: NBLW + DIN writes */
+  HASH_PHASE_KEY1_DCAL,       /* DCAL write after inner key */
+  HASH_PHASE_KEY1_WAIT,       /* polling BUSY */
+  HASH_PHASE_MSG,             /* message: NBLW + DIN writes */
+  HASH_PHASE_MSG_DCAL,        /* DCAL write after message */
+  HASH_PHASE_MSG_WAIT,        /* polling BUSY */
+  HASH_PHASE_KEY2,            /* outer key: NBLW + DIN writes */
+  HASH_PHASE_KEY2_DCAL,       /* DCAL write after outer key */
+  HASH_PHASE_FINAL_WAIT,      /* polling DCIS */
+  HASH_PHASE_DIGEST,          /* reading HR[0..7] */
+  HASH_PHASE_COUNT
+} hash_phase_t;
+
+/* Register (or, with NULL, unregister) the marker word. It must be Non-Secure. */
+secure_status_t SECURE_Probe_SetHashPhaseMarker(volatile uint32_t *marker);
 
 #endif /* SECURE_NSC_H */

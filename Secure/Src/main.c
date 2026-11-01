@@ -15,6 +15,7 @@
  */
 #include <arm_cmse.h>
 #include "stm32l5xx.h"
+#include "hash_hw.h"
 #include "secure_nsc.h"
 
 /* Same definition as ST's system_stm32l5xx_s.c (not exported in a header). */
@@ -46,6 +47,13 @@ static void gtzc_sram_setup(void)
   {
     GTZC_MPCBB2->VCTR[i] = 0U;
   }
+}
+
+/* Peripherals reset as Non-Secure in GTZC. The HASH peripheral holds the
+ * device key while computing an HMAC, so only Secure code may reach it. */
+static void gtzc_periph_setup(void)
+{
+  GTZC_TZSC->SECCFGR2 |= GTZC_TZSC_SECCFGR2_HASHSEC_Msk;
 }
 
 static void board_io_setup(void)
@@ -215,6 +223,8 @@ int main(void)
   icache_enable();
   cycle_counter_enable();
   gtzc_sram_setup();
+  gtzc_periph_setup();
+  hash_hw_init();
   board_io_setup();
   nvic_route_to_ns();
   nonsecure_boot();
